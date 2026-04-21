@@ -646,6 +646,23 @@ install_dependencies() {
     log_success "依赖安装完成"
 }
 
+download_file() {
+    local url="$1"
+    local output="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$output"
+        return $?
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO "$output" "$url"
+        return $?
+    fi
+
+    return 1
+}
+
 install_kernel_modules() {
     log_section "配置内核模块"
     
@@ -1365,6 +1382,290 @@ swap_menu() {
         0) return 0 ;;
         *) log_warn "无效选择" ;;
     esac
+}
+
+has_docker_compose_plugin() {
+    docker compose version >/dev/null 2>&1
+}
+
+has_docker_compose_legacy() {
+    command -v docker-compose >/dev/null 2>&1
+}
+
+get_docker_compose_status_text() {
+    local version_text=""
+    if has_docker_compose_plugin; then
+        version_text=$(docker compose version --short 2>/dev/null || docker compose version 2>/dev/null | head -1)
+        echo "Docker Compose: 已安装 (plugin ${version_text:-ok})"
+    elif has_docker_compose_legacy; then
+        version_text=$(docker-compose version --short 2>/dev/null || docker-compose version 2>/dev/null | head -1)
+        echo "Docker Compose: 已安装 (legacy ${version_text:-ok})"
+    else
+        echo "Docker Compose: 未安装"
+    fi
+}
+
+is_frps_installed() {
+    command -v frps >/dev/null 2>&1 || \
+    [[ -x /usr/local/bin/frps ]] || \
+    [[ -x /usr/bin/frps ]] || \
+    [[ -f /etc/systemd/system/frps.service ]] || \
+    [[ -f /lib/systemd/system/frps.service ]] || \
+    [[ -f /etc/init.d/frps ]]
+}
+
+is_frps_running() {
+    service_is_active_any frps || pgrep -x frps >/dev/null 2>&1
+}
+
+get_frps_status_text() {
+    if is_frps_installed; then
+        if is_frps_running; then
+            echo "FRPS: 已安装并运行中"
+        else
+            echo "FRPS: 已安装但未运行"
+        fi
+    else
+        echo "FRPS: 未安装"
+    fi
+}
+
+ensure_docker_compose_repo_apt() {
+    local repo_os codename arch
+    repo_os="$OS_TYPE"
+    [[ "$repo_os" == "debian" || "$repo_os" == "ubuntu" ]] || repo_os="debian"
+
+    arch=$(dpkg --print-architecture 2>/dev/null || echo "")
+    codename=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
+    [[ -n "$codename" ]] || codename=$(lsb_release -cs 2>/dev/null || echo "")
+
+    if [[ -z "$arch" || -z "$codename" ]]; then
+        log_error "无法识别 Debian/Ubuntu 架构或发行代号，无法配置 Docker 仓库"
+        return 1
+    fi
+
+    install -m 0755 -d /etc/apt/keyrings
+    if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
+        download_file "https://download.docker.com/linux/${repo_os}/gpg" "/etc/apt/keyrings/docker.asc" || return 1
+        chmod a+r /etc/apt/keyrings/docker.asc
+    fi
+
+    cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${repo_os} ${codename} stable
+EOF
+    apt-get update -qq
+}
+
+ensure_docker_compose_repo_rpm() {
+    cat > /etc/yum.repos.d/docker-ce.repo <<'EOF'
+[docker-ce-stable]
+name=Docker CE Stable - $basearch
+baseurl=https://download.docker.com/linux/centos/$releasever/$basearch/stable
+enabled=1
+gpgcheck=1
+gpgkey=https://download.docker.com/linux/centos/gpg
+EOF
+
+    case $PKG_MANAGER in
+        dnf) dnf makecache -q ;;
+        yum) yum makecache -q ;;
+    esac
+}
+
+get_compose_plugin_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        armv7l|armv7) echo "armv7" ;;
+        armv6l|armv6) echo "armv6" ;;
+        ppc64le) echo "ppc64le" ;;
+        s390x) echo "s390x" ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+install_docker_compose_manual_fallback() {
+    local arch plugin_dir plugin_path
+    arch=$(get_compose_plugin_arch) || {
+        log_error "未支持的架构: $(uname -m)"
+        return 1
+    }
+
+    if ! command -v docker >/dev/null 2>&1; then
+        log_error "缺少 docker CLI，无法使用手动插件兜底安装"
+        return 1
+    fi
+
+    plugin_dir="/usr/local/lib/docker/cli-plugins"
+    plugin_path="${plugin_dir}/docker-compose"
+    mkdir -p "$plugin_dir"
+
+    if ! download_file "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${arch}" "$plugin_path"; then
+        log_error "手动下载 Docker Compose 插件失败"
+        rm -f "$plugin_path"
+        return 1
+    fi
+
+    chmod +x "$plugin_path"
+}
+
+install_docker_compose_tool() {
+    log_section "快速补全缺失工具: Docker Compose"
+    detect_os
+    detect_pkg_manager
+
+    if has_docker_compose_plugin || has_docker_compose_legacy; then
+        log_success "$(get_docker_compose_status_text)"
+        return 0
+    fi
+
+    update_pkg_cache
+    install_dependencies
+
+    case $PKG_MANAGER in
+        apt)
+            if ! apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1; then
+                log_info "当前仓库未提供 docker-compose-plugin，尝试接入 Docker 官方仓库"
+                ensure_docker_compose_repo_apt || true
+                apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || \
+                apt-get install -y -qq docker-ce-cli docker-compose-plugin >/dev/null 2>&1 || true
+            fi
+            ;;
+        apk)
+            apk add --quiet docker-cli docker-cli-compose >/dev/null 2>&1 || \
+            apk add --quiet docker-compose >/dev/null 2>&1 || true
+            ;;
+        dnf|yum)
+            if ! $PKG_MANAGER install -y -q docker-compose-plugin >/dev/null 2>&1; then
+                log_info "当前仓库未提供 docker-compose-plugin，尝试接入 Docker 官方仓库"
+                ensure_docker_compose_repo_rpm || true
+                $PKG_MANAGER install -y -q docker-compose-plugin >/dev/null 2>&1 || \
+                $PKG_MANAGER install -y -q docker-ce-cli docker-compose-plugin >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+
+    if ! has_docker_compose_plugin; then
+        log_warn "包管理器安装未成功，尝试手动插件兜底"
+        install_docker_compose_manual_fallback || true
+    fi
+
+    if has_docker_compose_plugin; then
+        log_success "$(get_docker_compose_status_text)"
+    else
+        log_error "Docker Compose 安装失败"
+        return 1
+    fi
+}
+
+run_frps_helper() {
+    local action="$1"
+    local helper_script="/tmp/install-frps.sh"
+    local helper_url="https://raw.githubusercontent.com/MvsCode/frps-onekey/master/install-frps.sh"
+
+    detect_os
+    detect_pkg_manager
+    update_pkg_cache
+    install_dependencies
+
+    log_warn "即将执行第三方脚本: ${helper_url}"
+    if ! download_file "$helper_url" "$helper_script"; then
+        log_error "下载 FRPS 一键脚本失败"
+        return 1
+    fi
+
+    chmod 700 "$helper_script"
+    bash "$helper_script" "$action"
+    local rc=$?
+    rm -f "$helper_script"
+    return $rc
+}
+
+install_frps_onekey() {
+    log_section "快速补全缺失工具: FRPS"
+
+    if is_frps_installed; then
+        log_info "$(get_frps_status_text)"
+        read -p "FRPS 已存在，是否继续执行第三方安装脚本覆盖/修复? [y/N]: " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+    fi
+
+    run_frps_helper install || {
+        log_error "FRPS 安装脚本执行失败"
+        return 1
+    }
+
+    if is_frps_installed; then
+        log_success "$(get_frps_status_text)"
+    else
+        log_warn "FRPS 脚本已执行，请根据输出确认安装结果"
+    fi
+}
+
+uninstall_frps_onekey() {
+    log_section "卸载 FRPS"
+    run_frps_helper uninstall || {
+        log_error "FRPS 卸载脚本执行失败"
+        return 1
+    }
+
+    if is_frps_installed; then
+        log_warn "FRPS 可能仍有残留，请手动检查"
+    else
+        log_success "FRPS 卸载完成"
+    fi
+}
+
+show_tools_menu() {
+    while true; do
+        clear
+        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
+        printf "%b\n" "${CYAN}║        快速补全缺失工具 (Docker Compose / FRPS)             ║"
+        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${CYAN}$(get_docker_compose_status_text)${NC}"
+        echo -e "${CYAN}$(get_frps_status_text)${NC}"
+        echo ""
+        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
+        printf "%b\n" "${CYAN}║     1) 查看工具状态                                          ║"
+        printf "%b\n" "${CYAN}║     2) 安装 Docker Compose                                   ║"
+        printf "%b\n" "${CYAN}║     3) 安装 FRPS 一键脚本                                    ║"
+        printf "%b\n" "${CYAN}║     4) 卸载 FRPS                                             ║"
+        printf "%b\n" "${CYAN}║     0) 返回主菜单                                            ║"
+        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+        read -p "请输入选择 [0-4]: " tools_choice
+        case $tools_choice in
+            1)
+                pause_return_main_menu
+                return 0
+                ;;
+            2)
+                install_docker_compose_tool
+                pause_return_main_menu
+                return 0
+                ;;
+            3)
+                install_frps_onekey
+                pause_return_main_menu
+                return 0
+                ;;
+            4)
+                uninstall_frps_onekey
+                pause_return_main_menu
+                return 0
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                log_error "无效选择"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 configure_static_buffers() {
@@ -3504,6 +3805,10 @@ show_help() {
     echo "║    api-sysctl - Serverspan 自动检测/预览/应用                 ║"
     echo "║    api-general - 一键应用 Serverspan general 默认配置         ║"
     echo "║    ipv4-prefer - 设置 IPv4 优先 (不关闭 IPv6)                ║"
+    echo "║    tools      - 快速补全 Docker Compose / FRPS               ║"
+    echo "║    compose-install - 自动安装 Docker Compose                 ║"
+    echo "║    frps-install - 下载并执行 FRPS 一键安装脚本               ║"
+    echo "║    frps-uninstall - 下载并执行 FRPS 卸载脚本                 ║"
     echo "║                                                              ║"
     echo "║  安全检查命令:                                               ║"
     echo "║    ssh        - 开启 SSH root 密码登录                       ║"
@@ -3624,19 +3929,20 @@ show_main_menu() {
     printf "%b\n" "${CYAN}║    13) 查看全部监听端口 (含 nft/iptables 概览)               ║"
     printf "%b\n" "${CYAN}║                                                              ║"
     printf "%b\n" "${CYAN}║   ${MAGENTA}系统维护${CYAN}                                                  ║"
-    printf "%b\n" "${CYAN}║    14) Swap 管理                                             ║"
-    printf "%b\n" "${CYAN}║    15) 检测服务商原生调优参数 (基线对比+来源扫描)            ║"
-    printf "%b\n" "${CYAN}║    16) Serverspan 自动检测/预览/应用                         ║"
-    printf "%b\n" "${CYAN}║    17) 设置 IPv4 优先 (不关闭 IPv6)                          ║"
-    printf "%b\n" "${CYAN}║    18) 重建服务商基线 (搜刮系统 sysctl 配置来源)             ║"
-    printf "%b\n" "${CYAN}║    19) 按服务商基线恢复参数                                  ║"
+    printf "%b\n" "${CYAN}║    14) 快速补全缺失工具 (Docker Compose / FRPS)              ║"
+    printf "%b\n" "${CYAN}║    15) Swap 管理                                             ║"
+    printf "%b\n" "${CYAN}║    16) 检测服务商原生调优参数 (基线对比+来源扫描)            ║"
+    printf "%b\n" "${CYAN}║    17) Serverspan 自动检测/预览/应用                         ║"
+    printf "%b\n" "${CYAN}║    18) 设置 IPv4 优先 (不关闭 IPv6)                          ║"
+    printf "%b\n" "${CYAN}║    19) 重建服务商基线 (搜刮系统 sysctl 配置来源)             ║"
+    printf "%b\n" "${CYAN}║    20) 按服务商基线恢复参数                                  ║"
     printf "%b\n" "${CYAN}║                                                              ║"
     printf "%b\n" "${CYAN}║     0) 退出                                                  ║"
     printf "%b\n" "${CYAN}║     q) 退出脚本                                              ║"
     printf "%b\n" "${CYAN}║                                                              ║"
     printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     
-    read -p "请输入选择 [0-19/q]: " menu_choice
+    read -p "请输入选择 [0-20/q]: " menu_choice
     
     local should_pause=1
     case $menu_choice in
@@ -3683,21 +3989,25 @@ show_main_menu() {
             list_all_listening_ports
             ;;
         14)
-            swap_menu
+            show_tools_menu
+            should_pause=0
             ;;
         15)
-            detect_provider_tuning_params
+            swap_menu
             ;;
         16)
-            apply_serverspan_api_profile general 0
+            detect_provider_tuning_params
             ;;
         17)
-            apply_ipv4_preference_no_disable_ipv6
+            apply_serverspan_api_profile general 0
             ;;
         18)
-            rebuild_provider_baseline_from_sources
+            apply_ipv4_preference_no_disable_ipv6
             ;;
         19)
+            rebuild_provider_baseline_from_sources
+            ;;
+        20)
             restore_provider_tuning_baseline
             ;;
         0|q|Q)
@@ -3871,6 +4181,22 @@ main() {
 
         extensions|extension|ext)
             show_extension_menu
+            ;;
+
+        tools|tooling|quick-tools)
+            show_tools_menu
+            ;;
+
+        compose-install|docker-compose|docker-compose-install)
+            install_docker_compose_tool
+            ;;
+
+        frps-install|frp-install)
+            install_frps_onekey
+            ;;
+
+        frps-uninstall|frps-remove|frp-uninstall|frp-remove)
+            uninstall_frps_onekey
             ;;
 
         vendor-check|provider-check|baseline-check)
