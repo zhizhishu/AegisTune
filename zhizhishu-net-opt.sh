@@ -2086,125 +2086,126 @@ snapshot_menu() {
 print_system_status_card() {
     echo -e "${CYAN}┌──────────────────────────────────────────────────┐${NC}"
     echo -e "${CYAN}│              📊 系统状态面板                     │${NC}"
-    echo -e "${CYAN}├────────────────────────┬─────────────────────────┤${NC}"
+    echo -e "${CYAN}├──────────────────────────────────────────────────┤${NC}"
 
     local cc cc_cell qdisc qdisc_cell
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     if [[ "$cc" == "bbr" ]]; then
-        cc_cell="${GREEN}拥塞: BBR ✓${NC}"
+        cc_cell="${GREEN}BBR ✓${NC}"
     else
-        cc_cell="${YELLOW}拥塞: ${cc}${NC}"
+        cc_cell="${YELLOW}${cc}${NC}"
     fi
 
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
     if [[ "$qdisc" == "fq" || "$qdisc" == "cake" ]]; then
-        qdisc_cell="${GREEN}队列: ${qdisc^^} ✓${NC}"
+        qdisc_cell="${GREEN}${qdisc^^} ✓${NC}"
     else
-        qdisc_cell="${YELLOW}队列: ${qdisc}${NC}"
+        qdisc_cell="${YELLOW}${qdisc}${NC}"
     fi
-    render_status_panel_row "$cc_cell" "$qdisc_cell"
+    render_status_card_line "拥塞控制:     " "$cc_cell"
+    render_status_card_line "队列调度:     " "$qdisc_cell"
 
     local ipv4_addr ipv4_public ipv4_forward ipv6_addr ipv6_public ipv6_forward
-    local ipv4_addr_short ipv4_public_short ipv6_addr_short ipv6_public_short
     ipv4_addr=$(get_primary_ipv4)
     ipv4_public=$(get_public_ipv4 2>/dev/null || true)
     ipv4_forward=$(get_ipv4_forwarding_status)
     ipv6_addr=$(get_primary_ipv6)
     ipv6_public=$(get_public_ipv6 2>/dev/null || true)
     ipv6_forward=$(get_ipv6_forwarding_status)
-    ipv4_addr_short=$(truncate_status_value "${ipv4_addr:-未检测到}" 13)
-    ipv4_public_short=$(truncate_status_value "${ipv4_public:-未获取}" 13)
-    ipv6_addr_short=$(truncate_status_value "${ipv6_addr:-未检测到}" 13)
-    ipv6_public_short=$(truncate_status_value "${ipv6_public:-未获取}" 13)
 
     local ipv4_public_cell ipv4_forward_cell ipv6_public_cell ipv6_forward_cell
     local ipv4_local_cell ipv6_local_cell
     if [[ -n "$ipv4_public" ]]; then
-        ipv4_public_cell="${GREEN}IPv4公网: ${ipv4_public_short}${NC}"
+        ipv4_public_cell="${GREEN}${ipv4_public}${NC}"
     else
-        ipv4_public_cell="${YELLOW}IPv4公网: 未获取${NC}"
+        ipv4_public_cell="${YELLOW}未获取${NC}"
     fi
     if [[ "$ipv4_forward" == "已启用" ]]; then
-        ipv4_forward_cell="${GREEN}IPv4转发: 开 ✓${NC}"
+        ipv4_forward_cell="${GREEN}开 ✓${NC}"
     else
-        ipv4_forward_cell="${YELLOW}IPv4转发: 关${NC}"
+        ipv4_forward_cell="${YELLOW}关${NC}"
     fi
-    render_status_panel_row "$ipv4_public_cell" "$ipv4_forward_cell"
+    render_status_card_line "IPv4公网:      " "$ipv4_public_cell"
+    render_status_card_line "IPv4转发:      " "$ipv4_forward_cell"
 
     if [[ -n "$ipv4_addr" ]]; then
         if is_private_ipv4 "$ipv4_addr"; then
-            ipv4_local_cell="${YELLOW}IPv4本机: ${ipv4_addr_short}${NC}"
+            ipv4_local_cell="${YELLOW}${ipv4_addr}${NC}"
         else
-            ipv4_local_cell="${GREEN}IPv4本机: ${ipv4_addr_short}${NC}"
+            ipv4_local_cell="${GREEN}${ipv4_addr}${NC}"
         fi
     else
-        ipv4_local_cell="${YELLOW}IPv4本机: 未检测到${NC}"
+        ipv4_local_cell="${YELLOW}未检测到${NC}"
     fi
+    render_status_card_line "IPv4本机:      " "$ipv4_local_cell"
 
     if [[ -n "$ipv6_public" ]]; then
-        ipv6_public_cell="${GREEN}IPv6公网: ${ipv6_public_short}${NC}"
+        ipv6_public_cell="${GREEN}${ipv6_public}${NC}"
     else
-        ipv6_public_cell="${YELLOW}IPv6公网: 未获取${NC}"
+        ipv6_public_cell="${YELLOW}未获取${NC}"
     fi
     if [[ "$ipv6_forward" == "已启用" ]]; then
-        ipv6_forward_cell="${GREEN}IPv6转发: 开 ✓${NC}"
+        ipv6_forward_cell="${GREEN}开 ✓${NC}"
     elif [[ "$ipv6_forward" == "未检测到" ]]; then
-        ipv6_forward_cell="${YELLOW}IPv6转发: 未检测到${NC}"
+        ipv6_forward_cell="${YELLOW}未检测到${NC}"
     else
-        ipv6_forward_cell="${YELLOW}IPv6转发: 关${NC}"
+        ipv6_forward_cell="${YELLOW}关${NC}"
     fi
-    render_status_panel_row "$ipv6_public_cell" "$ipv6_forward_cell"
+    render_status_card_line "IPv6公网:      " "$ipv6_public_cell"
+    render_status_card_line "IPv6转发:      " "$ipv6_forward_cell"
 
     if [[ -n "$ipv6_addr" ]]; then
         if is_global_ipv6 "$ipv6_addr"; then
-            ipv6_local_cell="${GREEN}IPv6本机: ${ipv6_addr_short}${NC}"
+            ipv6_local_cell="${GREEN}${ipv6_addr}${NC}"
         else
-            ipv6_local_cell="${YELLOW}IPv6本机: ${ipv6_addr_short}${NC}"
+            ipv6_local_cell="${YELLOW}${ipv6_addr}${NC}"
         fi
     else
-        ipv6_local_cell="${YELLOW}IPv6本机: 未检测到${NC}"
+        ipv6_local_cell="${YELLOW}未检测到${NC}"
     fi
-    render_status_panel_row "$ipv4_local_cell" "$ipv6_local_cell"
-    echo -e "${CYAN}├────────────────────────┼─────────────────────────┤${NC}"
+    render_status_card_line "IPv6本机:      " "$ipv6_local_cell"
+    echo -e "${CYAN}├──────────────────────────────────────────────────┤${NC}"
 
     local bpftune_cell tcp_buffer_cell brutal_cell nginx_cell
     if is_bpftune_installed; then
         if is_bpftune_running; then
-            bpftune_cell="${GREEN}bpftune: 运行中 ✓${NC}"
+            bpftune_cell="${GREEN}运行中 ✓${NC}"
         else
-            bpftune_cell="${YELLOW}bpftune: 已安装${NC}"
+            bpftune_cell="${YELLOW}已安装${NC}"
         fi
     else
-        bpftune_cell="${YELLOW}bpftune: 未安装${NC}"
+        bpftune_cell="${YELLOW}未安装${NC}"
     fi
+    render_status_card_line "bpftune:       " "$bpftune_cell"
 
     local rmem_max
     rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "")
     if [[ -n "$rmem_max" && "$rmem_max" =~ ^[0-9]+$ ]]; then
         local rmem_mib
         rmem_mib=$(awk -v v="$rmem_max" 'BEGIN {printf "%.1f", v/1024/1024}')
-        tcp_buffer_cell="${GREEN}缓冲: ${rmem_mib} MiB${NC}"
+        tcp_buffer_cell="${GREEN}${rmem_mib} MiB${NC}"
     else
-        tcp_buffer_cell="${YELLOW}缓冲: 未知${NC}"
+        tcp_buffer_cell="${YELLOW}未知${NC}"
     fi
-    render_status_panel_row "$bpftune_cell" "$tcp_buffer_cell"
+    render_status_card_line "TCP 缓冲区:    " "$tcp_buffer_cell"
 
     if is_tcp_brutal_loaded; then
-        brutal_cell="${GREEN}Brutal: 已加载${NC}"
+        brutal_cell="${GREEN}已加载${NC}"
     elif is_tcp_brutal_installed; then
-        brutal_cell="${YELLOW}Brutal: 已安装${NC}"
+        brutal_cell="${YELLOW}已安装${NC}"
     else
-        brutal_cell="${YELLOW}Brutal: 未安装${NC}"
+        brutal_cell="${YELLOW}未安装${NC}"
     fi
+    render_status_card_line "TCP Brutal:    " "$brutal_cell"
 
     if is_brutal_nginx_installed; then
-        nginx_cell="${GREEN}Nginx模组: 已安装${NC}"
+        nginx_cell="${GREEN}已安装${NC}"
     else
-        nginx_cell="${YELLOW}Nginx模组: 未安装${NC}"
+        nginx_cell="${YELLOW}未安装${NC}"
     fi
-    render_status_panel_row "$brutal_cell" "$nginx_cell"
+    render_status_card_line "brutal-nginx:  " "$nginx_cell"
 
-    echo -e "${CYAN}└────────────────────────┴─────────────────────────┘${NC}"
+    echo -e "${CYAN}└──────────────────────────────────────────────────┘${NC}"
 }
 
 # ============ 验证 ============
@@ -2682,6 +2683,12 @@ truncate_status_value() {
 
 strip_ansi_codes() {
     printf '%s' "$1" | sed -E $'s/\x1B\\[[0-9;]*m//g'
+}
+
+render_status_card_line() {
+    local label="$1"
+    local value="$2"
+    printf "%b\n" "${CYAN}│${NC}  ${label} ${value}"
 }
 
 get_visible_text_length() {
