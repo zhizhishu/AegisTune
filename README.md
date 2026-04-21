@@ -29,6 +29,11 @@ sudo ./zhizhishu-net-opt.sh status
 - 检测服务商原生 `sysctl` 配置，并支持重建/恢复基线
 - 支持 `Serverspan` 自动调优，失败时自动回退到本地模板
 - 自动挡会识别 `Serverspan` 过保守的 TCP 缓冲，并按内存/场景做本地修正
+- 新增 `智能 BDP 自动调优`：
+  - 手动带宽 + 地区估算 RTT
+  - `speedtest` 自动测速 + 地区估算 RTT
+  - 手动带宽 + RTT 实测
+  - `speedtest` 自动测速 + RTT 实测
 - 支持 `IPv4 优先` 设置，不强制关闭 IPv6
 - 集成 SSH / Fail2ban / 端口 / cron / authorized_keys 安全检查
 - 新增常用缺失工具补全：
@@ -100,6 +105,28 @@ AegisTune 的自动挡现在会：
 
 这样做的目的，是避免自动挡在 `8GB`、`12GB`、`16GB` 这类机器上仍然落到 `3.9 MiB` 一类明显过小的窗口。
 
+## Smart BDP Mode
+
+除了 `Serverspan` 自动挡，AegisTune 现在还提供 `智能 BDP 自动调优`。
+
+它借鉴了 `vps-tcp-tune` 的思路，但没有直接照搬整套代理专用参数，而是只保留通用且可解释的部分：
+
+- 带宽来源可选：
+  - 手动输入上传带宽
+  - `speedtest` 自动检测上传带宽
+- RTT 来源可选：
+  - 按地区使用默认 RTT 估值
+  - 对目标域名/IP 做 `ping` 实测 RTT
+- 最终根据 `带宽 × RTT` 计算 BDP，再叠加安全系数生成 TCP buffer
+- 结果会按机器内存做安全上限限制，避免小内存机器直接冲到不合理窗口
+
+这套模式更适合：
+
+- 跨境线路
+- 长 RTT
+- 明确知道自己出口带宽
+- 不想直接套 `Corona` 固定值，但也不接受 `Serverspan general` 的小窗口
+
 ## Safety Notes
 
 - `TCP Brutal` 不应被设为全局默认拥塞控制，脚本里已有保护逻辑
@@ -117,6 +144,11 @@ sudo ./zhizhishu-net-opt.sh tools
 sudo ./zhizhishu-net-opt.sh compose-install
 sudo ./zhizhishu-net-opt.sh frps-install
 sudo ./zhizhishu-net-opt.sh frps-uninstall
+sudo ./zhizhishu-net-opt.sh smart-bdp
+sudo ./zhizhishu-net-opt.sh smart-bdp-manual
+sudo ./zhizhishu-net-opt.sh smart-bdp-speedtest
+sudo ./zhizhishu-net-opt.sh smart-bdp-rtt
+sudo ./zhizhishu-net-opt.sh smart-bdp-auto-rtt
 ```
 
 ## License

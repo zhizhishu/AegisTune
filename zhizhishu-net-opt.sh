@@ -188,6 +188,7 @@ PUBLIC_IPV6_CACHE="${STATUS_CACHE_ROOT}/public_ipv6.cache"
 SERVERSPAN_API_URL="https://www.serverspan.com/tools/api/sysctl_api.php"
 SERVERSPAN_WEB_URL="https://www.serverspan.com/en/tools/sysctl"
 SERVERSPAN_SYSCTL_FILE="/etc/sysctl.d/99-zhizhishu-serverspan.conf"
+SMART_BDP_SYSCTL_FILE="/etc/sysctl.d/99-zhizhishu-smart-bdp.conf"
 FORWARDING_OVERLAY_FILE="/etc/sysctl.d/99-zhizhishu-forwarding.conf"
 PROVIDER_RESTORE_FILE="/etc/sysctl.d/99-zhizhishu-provider-baseline-restore.conf"
 SERVERSPAN_LAST_API_HTTP_CODE=""
@@ -1854,6 +1855,7 @@ snapshot_tracked_files() {
 /etc/sysctl.d/99-bbr-aggressive.conf
 /etc/sysctl.d/99-cc.conf
 /etc/sysctl.d/99-zhizhishu-serverspan.conf
+/etc/sysctl.d/99-zhizhishu-smart-bdp.conf
 /etc/sysctl.d/99-zhizhishu-forwarding.conf
 /etc/sysctl.d/99-zhizhishu-provider-baseline-restore.conf
 /etc/modules-load.d/network-tuning.conf
@@ -1902,6 +1904,7 @@ is_managed_sysctl_file() {
         /etc/sysctl.d/99-bbr-aggressive.conf|\
         /etc/sysctl.d/99-cc.conf|\
         /etc/sysctl.d/99-zhizhishu-serverspan.conf|\
+        /etc/sysctl.d/99-zhizhishu-smart-bdp.conf|\
         /etc/sysctl.d/99-zhizhishu-forwarding.conf|\
         /etc/sysctl.d/99-zhizhishu-provider-baseline-restore.conf)
             return 0
@@ -2571,6 +2574,9 @@ uninstall() {
     # 删除配置文件
     rm -f /etc/sysctl.d/99-bbr-tuning.conf
     rm -f /etc/sysctl.d/99-bbr-aggressive.conf
+    rm -f /etc/sysctl.d/99-zhizhishu-serverspan.conf
+    rm -f /etc/sysctl.d/99-zhizhishu-smart-bdp.conf
+    rm -f /etc/sysctl.d/99-zhizhishu-forwarding.conf
     rm -f /etc/modules-load.d/network-tuning.conf
     
     sysctl --system > /dev/null 2>&1
@@ -3556,6 +3562,457 @@ apply_ipv4_preference_no_disable_ipv6() {
     log_info "配置文件: $gai_conf"
 }
 
+get_speedtest_cli_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_speedtest_cli() {
+    local arch download_url tmp_dir
+
+    if command -v speedtest >/dev/null 2>&1; then
+        return 0
+    fi
+
+    arch=$(get_speedtest_cli_arch) || {
+        log_error "当前架构 $(uname -m) 暂未支持自动安装 speedtest，请改用手动带宽输入"
+        return 1
+    }
+
+    detect_pkg_manager
+    update_pkg_cache
+    install_dependencies
+
+    download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-${arch}.tgz"
+    tmp_dir=$(mktemp -d)
+    if ! download_file "$download_url" "$tmp_dir/speedtest.tgz"; then
+        rm -rf "$tmp_dir"
+        log_error "下载 speedtest CLI 失败"
+        return 1
+    fi
+
+    if ! tar -xzf "$tmp_dir/speedtest.tgz" -C "$tmp_dir"; then
+        rm -rf "$tmp_dir"
+        log_error "解压 speedtest CLI 失败"
+        return 1
+    fi
+
+    if [[ ! -f "$tmp_dir/speedtest" ]]; then
+        rm -rf "$tmp_dir"
+        log_error "speedtest 可执行文件不存在"
+        return 1
+    fi
+
+    install -m 755 "$tmp_dir/speedtest" /usr/local/bin/speedtest
+    rm -rf "$tmp_dir"
+
+    command -v speedtest >/dev/null 2>&1
+}
+
+measure_speedtest_upload_mbps() {
+    local output upload_speed rounded
+
+    ensure_speedtest_cli || return 1
+    log_info "正在运行 speedtest 上传测速..."
+
+    output=$(speedtest --accept-license --accept-gdpr 2>&1) || true
+    upload_speed=$(printf '%s\n' "$output" | sed -nE 's/.*[Uu]pload:[[:space:]]*([0-9]+(\.[0-9]+)?).*/\1/p' | head -1)
+    [[ -n "$upload_speed" ]] || upload_speed=$(printf '%s\n' "$output" | awk '/Upload:/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {print $i; exit}}')
+
+    if [[ -z "$upload_speed" ]]; then
+        log_error "speedtest 未返回可解析的上传带宽"
+        return 1
+    fi
+
+    rounded=$(awk -v v="$upload_speed" 'BEGIN {printf "%.0f", v}')
+    [[ "$rounded" =~ ^[0-9]+$ ]] || return 1
+    (( rounded > 0 )) || return 1
+    printf '%s\n' "$rounded"
+}
+
+get_region_default_rtt_ms() {
+    local region="$1"
+    case "$region" in
+        overseas) echo 200 ;;
+        *) echo 50 ;;
+    esac
+}
+
+get_region_label() {
+    local region="$1"
+    case "$region" in
+        overseas) echo "美国/欧洲" ;;
+        *) echo "亚太地区" ;;
+    esac
+}
+
+measure_ping_rtt_ms() {
+    local target="$1"
+    local output avg
+
+    output=$(ping -c 4 -W 2 "$target" 2>/dev/null) || return 1
+    avg=$(printf '%s\n' "$output" | sed -nE 's@.*= [0-9.]+/([0-9.]+)/[0-9.]+/[0-9.]+ ms.*@\1@p' | head -1)
+    [[ -n "$avg" ]] || avg=$(printf '%s\n' "$output" | sed -nE 's@.*= [0-9.]+/([0-9.]+)/[0-9.]+ ms.*@\1@p' | head -1)
+    [[ -n "$avg" ]] || return 1
+    awk -v v="$avg" 'BEGIN {printf "%.0f\n", v}'
+}
+
+calc_smart_bdp_min_bytes() {
+    local bandwidth_mbps="$1"
+    local rtt_ms="$2"
+    local ram_gb="$3"
+    local min_bytes=8388608
+
+    if (( rtt_ms >= 120 )); then
+        min_bytes=16777216
+    elif (( rtt_ms >= 60 )); then
+        min_bytes=12582912
+    fi
+
+    if (( bandwidth_mbps >= 2000 && ram_gb >= 2 && min_bytes < 16777216 )); then
+        min_bytes=16777216
+    fi
+    if (( bandwidth_mbps >= 5000 && ram_gb >= 4 && min_bytes < 25165824 )); then
+        min_bytes=25165824
+    fi
+
+    echo "$min_bytes"
+}
+
+calc_smart_bdp_headroom_factor() {
+    local rtt_source="$1"
+    if [[ "$rtt_source" == "measured" ]]; then
+        echo "1.25"
+    else
+        echo "1.50"
+    fi
+}
+
+calc_smart_bdp_buffer_bytes() {
+    local bandwidth_mbps="$1"
+    local rtt_ms="$2"
+    local ram_gb="$3"
+    local rtt_source="$4"
+    local headroom min_bytes max_bytes buffer_bytes
+
+    headroom=$(calc_smart_bdp_headroom_factor "$rtt_source")
+    min_bytes=$(calc_smart_bdp_min_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb")
+    max_bytes=$(calc_fallback_buffer_max_bytes "$ram_gb")
+
+    buffer_bytes=$(awk -v bw="$bandwidth_mbps" -v rtt="$rtt_ms" -v factor="$headroom" '
+        BEGIN {
+            printf "%.0f", (bw * 1000000 / 8) * (rtt / 1000) * factor
+        }')
+    [[ "$buffer_bytes" =~ ^[0-9]+$ ]] || buffer_bytes="$min_bytes"
+
+    if (( buffer_bytes < min_bytes )); then
+        buffer_bytes=$min_bytes
+    fi
+    if (( buffer_bytes > max_bytes )); then
+        buffer_bytes=$max_bytes
+    fi
+
+    echo "$buffer_bytes"
+}
+
+write_smart_bdp_sysctl() {
+    local output_file="$1"
+    local bandwidth_mbps="$2"
+    local bandwidth_source="$3"
+    local rtt_ms="$4"
+    local rtt_source="$5"
+    local rtt_target="$6"
+    local buffer_bytes="$7"
+    local ram_gb="$8"
+    local threads="$9"
+    local qdisc="${10}"
+
+    local def_buf mid_buf somaxconn syn_backlog netdev_backlog swappiness
+    local headroom_factor bdp_bytes
+    def_buf=$((buffer_bytes / 8))
+    (( def_buf < 1048576 )) && def_buf=1048576
+    (( def_buf > 16777216 )) && def_buf=16777216
+    mid_buf=$((buffer_bytes / 4))
+    (( mid_buf < 1048576 )) && mid_buf=1048576
+
+    somaxconn=$((1024 + threads * 256))
+    (( somaxconn < 1024 )) && somaxconn=1024
+    (( somaxconn > 16384 )) && somaxconn=16384
+    if (( bandwidth_mbps >= 1000 )); then
+        somaxconn=$((somaxconn * 2))
+        (( somaxconn > 32768 )) && somaxconn=32768
+    fi
+    syn_backlog=$((somaxconn * 2))
+    (( syn_backlog > 65535 )) && syn_backlog=65535
+    netdev_backlog=$((somaxconn * 4))
+    (( netdev_backlog > 65535 )) && netdev_backlog=65535
+
+    if (( ram_gb <= 2 )); then
+        swappiness=20
+    elif (( ram_gb <= 4 )); then
+        swappiness=10
+    else
+        swappiness=5
+    fi
+
+    headroom_factor=$(calc_smart_bdp_headroom_factor "$rtt_source")
+    bdp_bytes=$(awk -v bw="$bandwidth_mbps" -v rtt="$rtt_ms" '
+        BEGIN {
+            printf "%.0f", (bw * 1000000 / 8) * (rtt / 1000)
+        }')
+
+    cat > "$output_file" <<EOF
+# Generated by zhizhishu-net-opt smart BDP tuner
+# bandwidth_source=${bandwidth_source}
+# bandwidth_mbps=${bandwidth_mbps}
+# rtt_source=${rtt_source}
+# rtt_target=${rtt_target}
+# rtt_ms=${rtt_ms}
+# bdp_bytes=${bdp_bytes}
+# headroom_factor=${headroom_factor}
+# final_buffer_bytes=${buffer_bytes}
+# ram_gb=${ram_gb}
+net.core.default_qdisc = ${qdisc}
+net.ipv4.tcp_congestion_control = bbr
+net.core.somaxconn = ${somaxconn}
+net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
+net.core.netdev_max_backlog = ${netdev_backlog}
+net.core.rmem_max = ${buffer_bytes}
+net.core.wmem_max = ${buffer_bytes}
+net.core.rmem_default = ${def_buf}
+net.core.wmem_default = ${def_buf}
+net.ipv4.tcp_rmem = 16384 ${mid_buf} ${buffer_bytes}
+net.ipv4.tcp_wmem = 16384 ${mid_buf} ${buffer_bytes}
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 3
+vm.swappiness = ${swappiness}
+kernel.panic = 10
+EOF
+}
+
+apply_smart_bdp_profile() {
+    local bandwidth_mode="${1:-manual}"
+    local rtt_mode="${2:-region}"
+    local has_ipv6=0
+    local prefer_ipv4 ipv4_forward ipv6_forward enable_forwarding=0
+    local bandwidth_mbps rtt_ms rtt_source rtt_target bandwidth_source region region_label
+    local ram_gb threads qdisc candidate_file
+
+    log_section "智能 BDP 自动调优"
+    AUTO_BUFFER_FLOOR_APPLIED=0
+    AUTO_BUFFER_FLOOR_SOURCE=""
+    AUTO_BUFFER_ORIGINAL_MAX=""
+    AUTO_BUFFER_TARGET_MAX=""
+    detect_os
+    detect_pkg_manager
+    detect_kernel
+    system_has_ipv6 && has_ipv6=1
+
+    if [[ "$bandwidth_mode" == "speedtest" ]]; then
+        bandwidth_mbps=$(measure_speedtest_upload_mbps) || {
+            log_warn "自动测速失败，切换为手动输入带宽"
+            bandwidth_mode="manual"
+        }
+        if [[ -n "$bandwidth_mbps" ]]; then
+            bandwidth_source="speedtest"
+            log_success "已检测上传带宽: ${bandwidth_mbps} Mbps"
+        fi
+    fi
+
+    if [[ "$bandwidth_mode" != "speedtest" ]]; then
+        while true; do
+            read -p "请输入上传带宽（Mbps，例如 500 / 1000 / 2000，输入 0 返回）: " bandwidth_mbps
+            if [[ "$bandwidth_mbps" == "0" ]]; then
+                log_info "已取消智能 BDP 调优，返回上层菜单"
+                return 0
+            fi
+            if [[ "$bandwidth_mbps" =~ ^[0-9]+$ ]] && (( bandwidth_mbps > 0 )); then
+                break
+            fi
+            log_error "请输入有效的正整数带宽值"
+        done
+        bandwidth_source="manual"
+    fi
+
+    if [[ "$rtt_mode" == "measured" ]]; then
+        read -p "请输入 RTT 测试目标（域名或 IP，默认 1.1.1.1）: " rtt_target
+        [[ -z "$rtt_target" ]] && rtt_target="1.1.1.1"
+        rtt_ms=$(measure_ping_rtt_ms "$rtt_target") || {
+            log_warn "RTT 实测失败，改用地区近似 RTT"
+            rtt_mode="region"
+        }
+        if [[ -n "$rtt_ms" ]]; then
+            rtt_source="measured"
+            log_success "实测 RTT: ${rtt_ms} ms (target=${rtt_target})"
+        fi
+    fi
+
+    if [[ "$rtt_mode" != "measured" ]]; then
+        while true; do
+            echo ""
+            echo "请选择主要服务地区："
+            echo "1) 亚太地区（默认 RTT 50ms）"
+            echo "2) 美国/欧洲（默认 RTT 200ms）"
+            echo "0) 返回上层菜单"
+            read -p "请输入选择 [1/2/0]: " region
+            region="${region:-1}"
+            case "$region" in
+                1)
+                    region="asia"
+                    break
+                    ;;
+                2)
+                    region="overseas"
+                    break
+                    ;;
+                0)
+                    log_info "已取消智能 BDP 调优，返回上层菜单"
+                    return 0
+                    ;;
+                *)
+                    log_error "无效选择"
+                    ;;
+            esac
+        done
+        rtt_ms=$(get_region_default_rtt_ms "$region")
+        region_label=$(get_region_label "$region")
+        rtt_source="region:${region}"
+        rtt_target="$region_label"
+        log_info "将使用地区近似 RTT: ${region_label} -> ${rtt_ms} ms"
+    fi
+
+    local ans
+    read -p "是否启用 IPv4 优先（不关闭 IPv6）? [Y/n]: " ans
+    [[ "$ans" =~ ^[Nn]$ ]] && prefer_ipv4="0" || prefer_ipv4="1"
+
+    read -p "是否开启 IPv4 转发? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && ipv4_forward="1" || ipv4_forward="0"
+
+    if [[ "$has_ipv6" == "1" ]]; then
+        read -p "是否开启 IPv6 转发? [y/N]: " ans
+        [[ "$ans" =~ ^[Yy]$ ]] && ipv6_forward="1" || ipv6_forward="0"
+    else
+        ipv6_forward="0"
+        log_info "未检测到可用 IPv6，已跳过 IPv6 转发提问"
+    fi
+
+    if [[ "$ipv4_forward" == "1" || "$ipv6_forward" == "1" ]]; then
+        enable_forwarding=1
+    fi
+
+    ram_gb=$(detect_serverspan_ram_gb)
+    threads=$(detect_serverspan_threads)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "fq")
+    if [[ "$qdisc" != "cake" ]]; then
+        qdisc="fq"
+    fi
+
+    local buffer_bytes buffer_mib
+    buffer_bytes=$(calc_smart_bdp_buffer_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb" "$rtt_mode")
+    buffer_mib=$(format_mib_from_bytes "$buffer_bytes")
+    candidate_file=$(mktemp)
+
+    write_smart_bdp_sysctl "$candidate_file" "$bandwidth_mbps" "$bandwidth_source" "$rtt_ms" "$rtt_mode" "$rtt_target" "$buffer_bytes" "$ram_gb" "$threads" "$qdisc"
+    preview_sysctl_candidate "$candidate_file" "智能 BDP 自动调优 (${bandwidth_source} + ${rtt_source})"
+    log_info "BDP 结果: bandwidth=${bandwidth_mbps}Mbps, rtt=${rtt_ms}ms, 目标 TCP max=${buffer_mib} MiB, qdisc=${qdisc}"
+
+    read -p "是否应用以上智能 BDP 配置? [Y/n]: " ans
+    if [[ "$ans" =~ ^[Nn]$ ]]; then
+        log_info "已取消应用，候选配置未写入系统"
+        rm -f "$candidate_file"
+        return 0
+    fi
+
+    create_config_snapshot "before_smart_bdp_${bandwidth_source}_${rtt_mode}"
+    if [[ -f "$SMART_BDP_SYSCTL_FILE" ]]; then
+        cp "$SMART_BDP_SYSCTL_FILE" "${SMART_BDP_SYSCTL_FILE}.backup.$(date +%Y%m%d%H%M%S)"
+    fi
+    rm -f "$SERVERSPAN_SYSCTL_FILE"
+    cp "$candidate_file" "$SMART_BDP_SYSCTL_FILE"
+    rm -f "$candidate_file"
+
+    write_forwarding_overlay "$ipv4_forward" "$ipv6_forward"
+    if [[ "$prefer_ipv4" == "1" ]]; then
+        apply_ipv4_preference_no_disable_ipv6 1
+    fi
+
+    sysctl -p "$SMART_BDP_SYSCTL_FILE" >/dev/null 2>&1 || true
+    if [[ -f "$FORWARDING_OVERLAY_FILE" ]]; then
+        sysctl -p "$FORWARDING_OVERLAY_FILE" >/dev/null 2>&1 || true
+    fi
+    sysctl --system >/dev/null 2>&1 || true
+
+    log_success "智能 BDP 调优已应用: $SMART_BDP_SYSCTL_FILE"
+    log_info "生效摘要: ${bandwidth_source}/${bandwidth_mbps}Mbps + ${rtt_source}/${rtt_ms}ms => TCP max ${buffer_mib} MiB"
+    verify_installation
+}
+
+show_auto_tuning_menu() {
+    while true; do
+        clear
+        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
+        printf "%b\n" "${CYAN}║              自动调优 (Serverspan / 智能 BDP)               ║"
+        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
+        printf "%b\n" "${CYAN}║     1) Serverspan 自动检测/预览/应用                         ║"
+        printf "%b\n" "${CYAN}║     2) 智能 BDP 调优 (手动带宽 + 地区估算 RTT)              ║"
+        printf "%b\n" "${CYAN}║     3) 智能 BDP 调优 (speedtest + 地区估算 RTT)             ║"
+        printf "%b\n" "${CYAN}║     4) 智能 BDP 调优 (手动带宽 + RTT 实测)                  ║"
+        printf "%b\n" "${CYAN}║     5) 智能 BDP 调优 (speedtest + RTT 实测)                 ║"
+        printf "%b\n" "${CYAN}║     0) 返回主菜单                                            ║"
+        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+        read -p "请输入选择 [0-5]: " auto_choice
+        case "$auto_choice" in
+            1)
+                apply_serverspan_api_profile general 0
+                pause_return_main_menu
+                return 0
+                ;;
+            2)
+                apply_smart_bdp_profile manual region
+                pause_return_main_menu
+                return 0
+                ;;
+            3)
+                apply_smart_bdp_profile speedtest region
+                pause_return_main_menu
+                return 0
+                ;;
+            4)
+                apply_smart_bdp_profile manual measured
+                pause_return_main_menu
+                return 0
+                ;;
+            5)
+                apply_smart_bdp_profile speedtest measured
+                pause_return_main_menu
+                return 0
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                log_error "无效选择"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 preview_sysctl_candidate() {
     local candidate_file="$1"
     local source_label="$2"
@@ -3719,6 +4176,7 @@ EOF
     if [[ -f "$SERVERSPAN_SYSCTL_FILE" ]]; then
         cp "$SERVERSPAN_SYSCTL_FILE" "${SERVERSPAN_SYSCTL_FILE}.backup.$(date +%Y%m%d%H%M%S)"
     fi
+    rm -f "$SMART_BDP_SYSCTL_FILE"
     cp "$candidate_file" "$SERVERSPAN_SYSCTL_FILE"
     rm -f "$candidate_file"
 
@@ -3944,6 +4402,11 @@ show_help() {
     echo "║    dmit-corona/an4-corona - 直接应用指定 Corona 参数          ║"
     echo "║    api-sysctl - Serverspan 自动检测/预览/应用                 ║"
     echo "║    api-general - 一键应用 Serverspan general 默认配置         ║"
+    echo "║    smart-bdp - 打开智能 BDP 自动调优子菜单                    ║"
+    echo "║    smart-bdp-manual - 手动带宽 + 地区估算 RTT                 ║"
+    echo "║    smart-bdp-speedtest - speedtest + 地区估算 RTT            ║"
+    echo "║    smart-bdp-rtt - 手动带宽 + RTT 实测                        ║"
+    echo "║    smart-bdp-auto-rtt - speedtest + RTT 实测                 ║"
     echo "║    ipv4-prefer - 设置 IPv4 优先 (不关闭 IPv6)                ║"
     echo "║    tools      - 快速补全 Docker Compose / FRPS               ║"
     echo "║    compose-install - 自动安装 Docker Compose                 ║"
@@ -4072,7 +4535,7 @@ show_main_menu() {
     printf "%b\n" "${CYAN}║    14) 快速补全缺失工具 (Docker Compose / FRPS)              ║"
     printf "%b\n" "${CYAN}║    15) Swap 管理                                             ║"
     printf "%b\n" "${CYAN}║    16) 检测服务商原生调优参数 (基线对比+来源扫描)            ║"
-    printf "%b\n" "${CYAN}║    17) Serverspan 自动检测/预览/应用                         ║"
+    printf "%b\n" "${CYAN}║    17) 自动调优 (Serverspan / 智能 BDP)                      ║"
     printf "%b\n" "${CYAN}║    18) 设置 IPv4 优先 (不关闭 IPv6)                          ║"
     printf "%b\n" "${CYAN}║    19) 重建服务商基线 (搜刮系统 sysctl 配置来源)             ║"
     printf "%b\n" "${CYAN}║    20) 按服务商基线恢复参数                                  ║"
@@ -4139,7 +4602,8 @@ show_main_menu() {
             detect_provider_tuning_params
             ;;
         17)
-            apply_serverspan_api_profile general 0
+            show_auto_tuning_menu
+            should_pause=0
             ;;
         18)
             apply_ipv4_preference_no_disable_ipv6
@@ -4369,6 +4833,30 @@ main() {
 
         api-general|serverspan-general)
             apply_serverspan_api_profile general 1 1 0 0
+            ;;
+
+        smart-bdp|bdp-auto|smart-auto)
+            show_auto_tuning_menu
+            ;;
+
+        smart-bdp-manual|bdp-manual)
+            apply_smart_bdp_profile manual region
+            ;;
+
+        smart-bdp-speedtest|bdp-speedtest)
+            apply_smart_bdp_profile speedtest region
+            ;;
+
+        smart-bdp-rtt|bdp-rtt)
+            apply_smart_bdp_profile manual measured
+            ;;
+
+        smart-bdp-auto-rtt|bdp-auto-rtt)
+            apply_smart_bdp_profile speedtest measured
+            ;;
+
+        auto-tune|auto-tuning)
+            show_auto_tuning_menu
             ;;
 
         ipv4-prefer|prefer-ipv4)
