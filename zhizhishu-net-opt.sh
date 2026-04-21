@@ -2101,18 +2101,36 @@ print_system_status_card() {
         echo -e "${CYAN}│${NC}  队列调度:     ${YELLOW}${qdisc}${NC}"
     fi
 
-    local ipv4_addr
+    local ipv4_addr ipv4_forward ipv6_addr ipv6_forward ipv4_addr_short ipv6_addr_short
     ipv4_addr=$(get_primary_ipv4)
+    ipv4_forward=$(get_ipv4_forwarding_status)
+    ipv6_addr=$(get_primary_ipv6)
+    ipv6_forward=$(get_ipv6_forwarding_status)
+    ipv4_addr_short=$(truncate_status_value "${ipv4_addr:-未检测到}" 20)
+    ipv6_addr_short=$(truncate_status_value "${ipv6_addr:-未检测到}" 20)
+
     if [[ -n "$ipv4_addr" ]]; then
-        echo -e "${CYAN}│${NC}  IPv4 地址:    ${GREEN}${ipv4_addr}${NC}"
+        echo -e "${CYAN}│${NC}  IPv4 本机:    ${GREEN}${ipv4_addr_short}${NC}"
     else
-        echo -e "${CYAN}│${NC}  IPv4 地址:    ${YELLOW}未检测到${NC}"
+        echo -e "${CYAN}│${NC}  IPv4 本机:    ${YELLOW}未检测到${NC}"
+    fi
+    if [[ "$ipv4_forward" == "已启用" ]]; then
+        echo -e "${CYAN}│${NC}  IPv4 转发:    ${GREEN}${ipv4_forward} ✓${NC}"
+    else
+        echo -e "${CYAN}│${NC}  IPv4 转发:    ${YELLOW}${ipv4_forward}${NC}"
     fi
 
-    if system_has_ipv6; then
-        echo -e "${CYAN}│${NC}  IPv6 状态:    ${GREEN}已启用 ✓${NC}"
+    if [[ -n "$ipv6_addr" ]]; then
+        echo -e "${CYAN}│${NC}  IPv6 本机:    ${GREEN}${ipv6_addr_short}${NC}"
     else
-        echo -e "${CYAN}│${NC}  IPv6 状态:    ${YELLOW}未检测到${NC}"
+        echo -e "${CYAN}│${NC}  IPv6 本机:    ${YELLOW}未检测到${NC}"
+    fi
+    if [[ "$ipv6_forward" == "已启用" ]]; then
+        echo -e "${CYAN}│${NC}  IPv6 转发:    ${GREEN}${ipv6_forward} ✓${NC}"
+    elif [[ "$ipv6_forward" == "未检测到" ]]; then
+        echo -e "${CYAN}│${NC}  IPv6 转发:    ${YELLOW}${ipv6_forward}${NC}"
+    else
+        echo -e "${CYAN}│${NC}  IPv6 转发:    ${YELLOW}${ipv6_forward}${NC}"
     fi
 
     if is_bpftune_installed; then
@@ -2490,6 +2508,54 @@ get_primary_ipv4() {
         ipv4_addr=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\./) {print $i; exit}}')
     fi
     echo "$ipv4_addr"
+}
+
+get_primary_ipv6() {
+    local ipv6_addr=""
+    if command -v ip >/dev/null 2>&1; then
+        ipv6_addr=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+        if [[ -z "$ipv6_addr" ]]; then
+            ipv6_addr=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/ {sub(/\/.*/, "", $2); print $2; exit}')
+        fi
+    fi
+    echo "$ipv6_addr"
+}
+
+truncate_status_value() {
+    local value="$1"
+    local limit="${2:-20}"
+    local value_len=${#value}
+
+    if (( value_len <= limit )); then
+        echo "$value"
+    else
+        echo "${value:0:limit-3}..."
+    fi
+}
+
+get_ipv4_forwarding_status() {
+    local state
+    state=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "")
+    if [[ "$state" == "1" ]]; then
+        echo "已启用"
+    else
+        echo "未启用"
+    fi
+}
+
+get_ipv6_forwarding_status() {
+    if ! system_has_ipv6; then
+        echo "未检测到"
+        return 0
+    fi
+
+    local state
+    state=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo "")
+    if [[ "$state" == "1" ]]; then
+        echo "已启用"
+    else
+        echo "未启用"
+    fi
 }
 
 is_valid_serverspan_use_case() {
