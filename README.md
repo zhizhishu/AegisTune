@@ -32,6 +32,11 @@ sudo ./zhizhishu-net-opt.sh status
   - 用 `Serverspan / 本地模板` 补齐通用参数
   - 用 `Smart BDP` 专门决定 TCP buffer
   - 应用前先展示“最终值 + 来源 + 基线值 + 模板值 + BDP 候选”
+- 新增 `self-test / dry-run`
+  - 快速自检 `统一自动挡 / Serverspan / Smart BDP`
+  - 不写入 `/etc/sysctl.d`
+  - 不创建快照
+  - 不执行 `sysctl --system`
 - 支持 `Serverspan` 自动调优，失败时自动回退到本地模板
 - 自动挡会识别 `Serverspan` 过保守的 TCP 缓冲，并按内存/场景做本地修正
 - 新增 `智能 BDP 自动调优`：
@@ -119,6 +124,32 @@ https://raw.githubusercontent.com/MvsCode/frps-onekey/master/install-frps.sh
 - 不丢掉外部模板对通用项的补齐
 - 不再盲信 `Serverspan general` 这类过小 TCP buffer
 
+## Self-Test / Dry-Run
+
+如果你只想先验证三条自动调优链路能否跑通，而不改系统，可以直接运行：
+
+```bash
+./zhizhishu-net-opt.sh self-test
+./zhizhishu-net-opt.sh dry-run
+```
+
+这个命令默认：
+
+- 不要求 root
+- 不写 `/etc/sysctl.d`
+- 不创建快照
+- 不执行 `sysctl --system`
+- 会依次生成并展示：
+  - `Serverspan` dry-run 预览
+  - `Smart BDP` dry-run 预览
+  - `统一自动挡` dry-run 决策预览
+
+说明：
+
+- `self-test` 用的是探测值和近似值，只用于验证链路是否正常
+- 它不是最终推荐参数生成器
+- 真正应用参数仍然建议走主菜单里的自动调优
+
 ## Serverspan Auto Mode
 
 `Serverspan general/moderate` 当前返回的 TCP 缓冲偏保守，常见会落在 `4-8 MiB` 档。
@@ -176,6 +207,8 @@ sudo ./zhizhishu-net-opt.sh auto-unified-manual
 sudo ./zhizhishu-net-opt.sh auto-unified-speedtest
 sudo ./zhizhishu-net-opt.sh auto-unified-rtt
 sudo ./zhizhishu-net-opt.sh auto-unified-auto-rtt
+./zhizhishu-net-opt.sh self-test
+./zhizhishu-net-opt.sh dry-run
 sudo ./zhizhishu-net-opt.sh smart-bdp
 sudo ./zhizhishu-net-opt.sh smart-bdp-manual
 sudo ./zhizhishu-net-opt.sh smart-bdp-speedtest

@@ -204,6 +204,8 @@ SERVERSPAN_BUILD_USED_WEB=0
 SERVERSPAN_BUILD_USED_LOCAL=0
 SERVERSPAN_BUILD_RAM=0
 SERVERSPAN_BUILD_THREADS=0
+SELFTEST_RTT_SOURCE=""
+SELFTEST_RTT_TARGET=""
 
 # ============ 工具函数 ============
 
@@ -4067,10 +4069,11 @@ show_auto_tuning_menu() {
         printf "%b\n" "${CYAN}║     4) 统一自动调优 (speedtest + RTT 实测)                  ║"
         printf "%b\n" "${CYAN}║     5) 兼容模式: 仅 Serverspan 模板                         ║"
         printf "%b\n" "${CYAN}║     6) 兼容模式: 仅智能 BDP                                 ║"
+        printf "%b\n" "${CYAN}║     7) Self-Test / Dry-Run (三条链路自检，不改系统)         ║"
         printf "%b\n" "${CYAN}║     0) 返回主菜单                                            ║"
         printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
-        read -p "请输入选择 [0-6]: " auto_choice
+        read -p "请输入选择 [0-7]: " auto_choice
         case "$auto_choice" in
             1)
                 apply_unified_auto_profile manual region
@@ -4099,6 +4102,11 @@ show_auto_tuning_menu() {
                 ;;
             6)
                 show_smart_bdp_menu
+                pause_return_main_menu
+                return 0
+                ;;
+            7)
+                run_self_test_dry_run
                 pause_return_main_menu
                 return 0
                 ;;
@@ -4155,6 +4163,38 @@ show_smart_bdp_menu() {
                 ;;
         esac
     done
+}
+
+detect_selftest_bandwidth_mbps() {
+    local nic
+    nic=$(detect_serverspan_nic_speed 2>/dev/null || echo 0)
+    [[ "$nic" =~ ^[0-9]+$ ]] || nic=0
+
+    if (( nic <= 0 )); then
+        echo 1000
+    elif (( nic < 100 )); then
+        echo "$nic"
+    elif (( nic > 2000 )); then
+        echo 1000
+    else
+        echo "$nic"
+    fi
+}
+
+detect_selftest_rtt_ms() {
+    local target="${1:-1.1.1.1}"
+    local rtt
+
+    rtt=$(measure_ping_rtt_ms "$target" 2>/dev/null || true)
+    if [[ "$rtt" =~ ^[0-9]+$ ]] && (( rtt > 0 )); then
+        SELFTEST_RTT_SOURCE="measured"
+        SELFTEST_RTT_TARGET="$target"
+        echo "$rtt"
+    else
+        SELFTEST_RTT_SOURCE="fallback-region"
+        SELFTEST_RTT_TARGET="亚太地区"
+        echo 50
+    fi
 }
 
 preview_sysctl_candidate() {
@@ -4591,6 +4631,105 @@ apply_unified_auto_profile() {
     verify_installation
 }
 
+run_self_test_dry_run() {
+    local old_snapshot_root="$SNAPSHOT_ROOT"
+    local old_provider_baseline_file="$PROVIDER_BASELINE_FILE"
+    local old_provider_baseline_meta="$PROVIDER_BASELINE_META"
+    local old_provider_baseline_sourcemap="$PROVIDER_BASELINE_SOURCEMAP"
+    local old_serverspan_sysctl_file="$SERVERSPAN_SYSCTL_FILE"
+    local old_smart_bdp_sysctl_file="$SMART_BDP_SYSCTL_FILE"
+    local old_auto_merged_sysctl_file="$AUTO_MERGED_SYSCTL_FILE"
+    local old_forwarding_overlay_file="$FORWARDING_OVERLAY_FILE"
+
+    local temp_root use_case bandwidth_mbps rtt_ms qdisc ram_gb threads
+    local serverspan_candidate smart_candidate unified_template_candidate unified_candidate
+    local unified_decision_file buffer_bytes buffer_mib failed=0
+
+    log_section "Self-Test / Dry-Run"
+    log_info "本模式不会写入 /etc/sysctl.d，不会创建快照，不会执行 sysctl --system。"
+
+    detect_os
+    detect_kernel
+    detect_pkg_manager
+
+    temp_root=$(mktemp -d)
+    SNAPSHOT_ROOT="$temp_root"
+    PROVIDER_BASELINE_FILE="$temp_root/provider-baseline.sysctl"
+    PROVIDER_BASELINE_META="$temp_root/provider-baseline.meta"
+    PROVIDER_BASELINE_SOURCEMAP="$temp_root/provider-baseline-sources.map"
+    SERVERSPAN_SYSCTL_FILE="$temp_root/serverspan-preview.conf"
+    SMART_BDP_SYSCTL_FILE="$temp_root/smart-bdp-preview.conf"
+    AUTO_MERGED_SYSCTL_FILE="$temp_root/auto-merged-preview.conf"
+    FORWARDING_OVERLAY_FILE="$temp_root/forwarding-preview.conf"
+
+    ensure_provider_baseline || true
+
+    use_case="general"
+    bandwidth_mbps=$(detect_selftest_bandwidth_mbps)
+    rtt_ms=$(detect_selftest_rtt_ms "1.1.1.1")
+    log_info "自检参数: use_case=${use_case}, bandwidth=${bandwidth_mbps}Mbps, rtt=${rtt_ms}ms (${SELFTEST_RTT_SOURCE}:${SELFTEST_RTT_TARGET})"
+
+    serverspan_candidate=$(mktemp)
+    if build_serverspan_candidate_file "$use_case" "$serverspan_candidate" 1; then
+        log_success "Serverspan 链路自检通过"
+        preview_sysctl_candidate "$serverspan_candidate" "${SERVERSPAN_BUILD_SOURCE} (dry-run)"
+    else
+        log_error "Serverspan 链路自检失败"
+        failed=$((failed + 1))
+    fi
+
+    smart_candidate=$(mktemp)
+    ram_gb=$(detect_serverspan_ram_gb)
+    threads=$(detect_serverspan_threads)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "fq")
+    [[ "$qdisc" == "cake" ]] || qdisc="fq"
+    buffer_bytes=$(calc_smart_bdp_buffer_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb" "measured")
+    buffer_mib=$(format_mib_from_bytes "$buffer_bytes")
+    write_smart_bdp_sysctl "$smart_candidate" "$bandwidth_mbps" "self-test" "$rtt_ms" "measured" "$SELFTEST_RTT_TARGET" "$buffer_bytes" "$ram_gb" "$threads" "$qdisc"
+    log_success "Smart BDP 链路自检通过"
+    preview_sysctl_candidate "$smart_candidate" "智能 BDP 自检 (dry-run)"
+    log_info "Smart BDP 自检摘要: ${bandwidth_mbps}Mbps + ${rtt_ms}ms => TCP max ${buffer_mib} MiB"
+
+    unified_template_candidate=$(mktemp)
+    unified_candidate=$(mktemp)
+    unified_decision_file=$(mktemp)
+    if build_serverspan_candidate_file "$use_case" "$unified_template_candidate" 0; then
+        ram_gb="${SERVERSPAN_BUILD_RAM:-$ram_gb}"
+        threads="${SERVERSPAN_BUILD_THREADS:-$threads}"
+        qdisc=$(read_sysctl_value_from_file "$unified_template_candidate" "net.core.default_qdisc" 2>/dev/null || true)
+        [[ "$qdisc" == "cake" ]] || qdisc="fq"
+        buffer_bytes=$(calc_smart_bdp_buffer_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb" "measured")
+        write_smart_bdp_sysctl "$smart_candidate" "$bandwidth_mbps" "self-test" "$rtt_ms" "measured" "$SELFTEST_RTT_TARGET" "$buffer_bytes" "$ram_gb" "$threads" "$qdisc"
+        write_unified_auto_candidate "$unified_template_candidate" "$smart_candidate" "$unified_candidate" "$unified_decision_file"
+        log_success "统一自动挡链路自检通过"
+        preview_unified_auto_candidate "$unified_candidate" "$unified_decision_file" "$use_case" "$SERVERSPAN_BUILD_SOURCE (dry-run)" "$bandwidth_mbps" "self-test" "$rtt_ms" "measured" "$SELFTEST_RTT_TARGET"
+    else
+        log_error "统一自动挡链路自检失败"
+        failed=$((failed + 1))
+    fi
+
+    echo ""
+    if (( failed == 0 )); then
+        log_success "Self-Test 通过：统一自动挡 / Serverspan / Smart BDP 三条链路均已打通。"
+    else
+        log_warn "Self-Test 完成：共有 ${failed} 条链路失败，请根据上方日志排查。"
+    fi
+    log_info "提示: Self-Test 使用的是检测值和近似值，仅用于链路验证，不代表最终推荐参数。"
+
+    rm -rf "$temp_root"
+    rm -f "$serverspan_candidate" "$smart_candidate" "$unified_template_candidate" "$unified_candidate" "$unified_decision_file"
+    SNAPSHOT_ROOT="$old_snapshot_root"
+    PROVIDER_BASELINE_FILE="$old_provider_baseline_file"
+    PROVIDER_BASELINE_META="$old_provider_baseline_meta"
+    PROVIDER_BASELINE_SOURCEMAP="$old_provider_baseline_sourcemap"
+    SERVERSPAN_SYSCTL_FILE="$old_serverspan_sysctl_file"
+    SMART_BDP_SYSCTL_FILE="$old_smart_bdp_sysctl_file"
+    AUTO_MERGED_SYSCTL_FILE="$old_auto_merged_sysctl_file"
+    FORWARDING_OVERLAY_FILE="$old_forwarding_overlay_file"
+
+    (( failed == 0 ))
+}
+
 apply_serverspan_api_profile() {
     local use_case="${1:-general}"
     local non_interactive="${2:-0}"
@@ -4880,6 +5019,7 @@ show_help() {
     echo "║      zhizhishu 网络优化助手 (BBR + 扩展模块 + 快照)          ║"
     echo "╠══════════════════════════════════════════════════════════════╣"
     echo "║  用法: sudo bash $0 [命令]                                   ║"
+    echo "║  注: help / self-test / dry-run 可非 root 运行               ║"
     echo "║                                                              ║"
     echo "║  网络优化命令:                                               ║"
     echo "║    install   - 交互式安装 (FQ/CAKE，不安装 bpftune)          ║"
@@ -4898,6 +5038,7 @@ show_help() {
     echo "║    auto-unified-speedtest - 统一自动调优: speedtest+地区 RTT  ║"
     echo "║    auto-unified-rtt - 统一自动调优: 手动带宽+RTT 实测         ║"
     echo "║    auto-unified-auto-rtt - 统一自动调优: speedtest+RTT 实测   ║"
+    echo "║    self-test/dry-run - 自检三条链路，不改系统                 ║"
     echo "║    api-sysctl - 兼容模式: Serverspan 自动检测/预览/应用       ║"
     echo "║    api-general - 一键应用 Serverspan general 默认配置         ║"
     echo "║    smart-bdp - 打开兼容模式: 智能 BDP 子菜单                  ║"
@@ -5201,7 +5342,17 @@ run_status_check() {
 # ============ 主函数 ============
 
 main() {
-    check_root
+    if [[ $# -gt 0 ]]; then
+        case "$1" in
+            help|--help|-h|self-test|dry-run)
+                ;;
+            *)
+                check_root
+                ;;
+        esac
+    else
+        check_root
+    fi
     
     # 如果没有参数，显示交互式菜单
     if [[ $# -eq 0 ]]; then
@@ -5367,6 +5518,10 @@ main() {
 
         auto-unified-auto-rtt|auto-merge-auto-rtt|unified-auto-rtt)
             apply_unified_auto_profile speedtest measured
+            ;;
+
+        self-test|dry-run|auto-self-test|auto-dry-run)
+            run_self_test_dry_run
             ;;
 
         auto-tune|auto-tuning)
