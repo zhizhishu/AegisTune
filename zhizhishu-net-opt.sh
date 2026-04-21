@@ -189,6 +189,7 @@ SERVERSPAN_API_URL="https://www.serverspan.com/tools/api/sysctl_api.php"
 SERVERSPAN_WEB_URL="https://www.serverspan.com/en/tools/sysctl"
 SERVERSPAN_SYSCTL_FILE="/etc/sysctl.d/99-zhizhishu-serverspan.conf"
 SMART_BDP_SYSCTL_FILE="/etc/sysctl.d/99-zhizhishu-smart-bdp.conf"
+AUTO_MERGED_SYSCTL_FILE="/etc/sysctl.d/99-zhizhishu-auto-merged.conf"
 FORWARDING_OVERLAY_FILE="/etc/sysctl.d/99-zhizhishu-forwarding.conf"
 PROVIDER_RESTORE_FILE="/etc/sysctl.d/99-zhizhishu-provider-baseline-restore.conf"
 SERVERSPAN_LAST_API_HTTP_CODE=""
@@ -197,6 +198,12 @@ AUTO_BUFFER_FLOOR_APPLIED=0
 AUTO_BUFFER_FLOOR_SOURCE=""
 AUTO_BUFFER_ORIGINAL_MAX=""
 AUTO_BUFFER_TARGET_MAX=""
+SERVERSPAN_BUILD_SOURCE=""
+SERVERSPAN_BUILD_USED_API=0
+SERVERSPAN_BUILD_USED_WEB=0
+SERVERSPAN_BUILD_USED_LOCAL=0
+SERVERSPAN_BUILD_RAM=0
+SERVERSPAN_BUILD_THREADS=0
 
 # ============ 工具函数 ============
 
@@ -1856,6 +1863,7 @@ snapshot_tracked_files() {
 /etc/sysctl.d/99-cc.conf
 /etc/sysctl.d/99-zhizhishu-serverspan.conf
 /etc/sysctl.d/99-zhizhishu-smart-bdp.conf
+/etc/sysctl.d/99-zhizhishu-auto-merged.conf
 /etc/sysctl.d/99-zhizhishu-forwarding.conf
 /etc/sysctl.d/99-zhizhishu-provider-baseline-restore.conf
 /etc/modules-load.d/network-tuning.conf
@@ -1905,6 +1913,7 @@ is_managed_sysctl_file() {
         /etc/sysctl.d/99-cc.conf|\
         /etc/sysctl.d/99-zhizhishu-serverspan.conf|\
         /etc/sysctl.d/99-zhizhishu-smart-bdp.conf|\
+        /etc/sysctl.d/99-zhizhishu-auto-merged.conf|\
         /etc/sysctl.d/99-zhizhishu-forwarding.conf|\
         /etc/sysctl.d/99-zhizhishu-provider-baseline-restore.conf)
             return 0
@@ -2576,6 +2585,7 @@ uninstall() {
     rm -f /etc/sysctl.d/99-bbr-aggressive.conf
     rm -f /etc/sysctl.d/99-zhizhishu-serverspan.conf
     rm -f /etc/sysctl.d/99-zhizhishu-smart-bdp.conf
+    rm -f /etc/sysctl.d/99-zhizhishu-auto-merged.conf
     rm -f /etc/sysctl.d/99-zhizhishu-forwarding.conf
     rm -f /etc/modules-load.d/network-tuning.conf
     
@@ -3336,6 +3346,89 @@ read_sysctl_value_from_file() {
     ' "$file"
 }
 
+provider_baseline_value_is_explicit() {
+    local value="$1"
+    case "$value" in
+        ""|__unknown__|__unsupported__|__not_set_in_snapshot__|__not_set_in_sysctl_files__)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+provider_baseline_source_for_key() {
+    local key="$1"
+    [[ -f "$PROVIDER_BASELINE_SOURCEMAP" ]] || return 1
+    awk -F'|' -v key="$key" '$1 == key {print $2}' "$PROVIDER_BASELINE_SOURCEMAP" 2>/dev/null | tail -1
+}
+
+render_provider_baseline_source_label() {
+    local source_file="$1"
+    case "$source_file" in
+        ""|runtime)
+            echo "原厂/服务商基线(runtime)"
+            ;;
+        __kernel_default__)
+            echo "原厂/服务商基线(kernel-default)"
+            ;;
+        *)
+            echo "原厂/服务商基线($(basename "$source_file"))"
+            ;;
+    esac
+}
+
+is_unified_auto_buffer_key() {
+    case "$1" in
+        net.core.rmem_max|net.core.wmem_max|net.core.rmem_default|net.core.wmem_default|net.ipv4.tcp_rmem|net.ipv4.tcp_wmem)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_unified_auto_template_priority_key() {
+    case "$1" in
+        net.core.default_qdisc|net.ipv4.tcp_congestion_control|net.core.somaxconn|net.ipv4.tcp_max_syn_backlog|net.core.netdev_max_backlog)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_unified_auto_baseline_priority_key() {
+    case "$1" in
+        net.ipv4.tcp_adv_win_scale|net.ipv4.tcp_sack|net.ipv4.tcp_timestamps|net.ipv4.tcp_window_scaling|\
+        net.ipv4.tcp_tw_reuse|net.ipv4.tcp_fin_timeout|net.ipv4.tcp_fastopen|net.ipv4.tcp_mtu_probing|\
+        net.ipv4.tcp_keepalive_time|net.ipv4.tcp_keepalive_intvl|net.ipv4.tcp_keepalive_probes|\
+        fs.file-max|kernel.panic|vm.swappiness|vm.overcommit_memory)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+remove_sysctl_keys_from_file() {
+    local file="$1"
+    shift
+    [[ -f "$file" ]] || return 1
+    [[ $# -gt 0 ]] || return 0
+
+    local sed_args=()
+    local key
+    for key in "$@"; do
+        sed_args+=(-e "/^[[:space:]]*${key//./\\.}[[:space:]]*=.*/d")
+    done
+    sed -i -E "${sed_args[@]}" "$file"
+}
+
 calc_auto_buffer_floor_bytes() {
     local use_case="$1"
     local ram_gb="$2"
@@ -3942,6 +4035,7 @@ apply_smart_bdp_profile() {
     rm -f "$SERVERSPAN_SYSCTL_FILE"
     cp "$candidate_file" "$SMART_BDP_SYSCTL_FILE"
     rm -f "$candidate_file"
+    rm -f "$AUTO_MERGED_SYSCTL_FILE"
 
     write_forwarding_overlay "$ipv4_forward" "$ipv6_forward"
     if [[ "$prefer_ipv4" == "1" ]]; then
@@ -3963,43 +4057,93 @@ show_auto_tuning_menu() {
     while true; do
         clear
         printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
-        printf "%b\n" "${CYAN}║              自动调优 (Serverspan / 智能 BDP)               ║"
+        printf "%b\n" "${CYAN}║       自动调优 (统一自动挡 / Serverspan / 智能 BDP)         ║"
         printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
         echo ""
         printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
-        printf "%b\n" "${CYAN}║     1) Serverspan 自动检测/预览/应用                         ║"
-        printf "%b\n" "${CYAN}║     2) 智能 BDP 调优 (手动带宽 + 地区估算 RTT)              ║"
-        printf "%b\n" "${CYAN}║     3) 智能 BDP 调优 (speedtest + 地区估算 RTT)             ║"
-        printf "%b\n" "${CYAN}║     4) 智能 BDP 调优 (手动带宽 + RTT 实测)                  ║"
-        printf "%b\n" "${CYAN}║     5) 智能 BDP 调优 (speedtest + RTT 实测)                 ║"
+        printf "%b\n" "${CYAN}║     1) 统一自动调优 (手动带宽 + 地区估算 RTT)               ║"
+        printf "%b\n" "${CYAN}║     2) 统一自动调优 (speedtest + 地区估算 RTT)              ║"
+        printf "%b\n" "${CYAN}║     3) 统一自动调优 (手动带宽 + RTT 实测)                   ║"
+        printf "%b\n" "${CYAN}║     4) 统一自动调优 (speedtest + RTT 实测)                  ║"
+        printf "%b\n" "${CYAN}║     5) 兼容模式: 仅 Serverspan 模板                         ║"
+        printf "%b\n" "${CYAN}║     6) 兼容模式: 仅智能 BDP                                 ║"
         printf "%b\n" "${CYAN}║     0) 返回主菜单                                            ║"
         printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
-        read -p "请输入选择 [0-5]: " auto_choice
+        read -p "请输入选择 [0-6]: " auto_choice
         case "$auto_choice" in
             1)
-                apply_serverspan_api_profile general 0
+                apply_unified_auto_profile manual region
                 pause_return_main_menu
                 return 0
                 ;;
             2)
-                apply_smart_bdp_profile manual region
+                apply_unified_auto_profile speedtest region
                 pause_return_main_menu
                 return 0
                 ;;
             3)
-                apply_smart_bdp_profile speedtest region
+                apply_unified_auto_profile manual measured
                 pause_return_main_menu
                 return 0
                 ;;
             4)
-                apply_smart_bdp_profile manual measured
+                apply_unified_auto_profile speedtest measured
                 pause_return_main_menu
                 return 0
                 ;;
             5)
-                apply_smart_bdp_profile speedtest measured
+                apply_serverspan_api_profile general 0
                 pause_return_main_menu
+                return 0
+                ;;
+            6)
+                show_smart_bdp_menu
+                pause_return_main_menu
+                return 0
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                log_error "无效选择"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+show_smart_bdp_menu() {
+    while true; do
+        clear
+        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
+        printf "%b\n" "${CYAN}║                 兼容模式: 智能 BDP 子菜单                   ║"
+        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
+        printf "%b\n" "${CYAN}║     1) 手动带宽 + 地区估算 RTT                               ║"
+        printf "%b\n" "${CYAN}║     2) speedtest + 地区估算 RTT                              ║"
+        printf "%b\n" "${CYAN}║     3) 手动带宽 + RTT 实测                                   ║"
+        printf "%b\n" "${CYAN}║     4) speedtest + RTT 实测                                  ║"
+        printf "%b\n" "${CYAN}║     0) 返回上层菜单                                           ║"
+        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+        read -p "请输入选择 [0-4]: " smart_choice
+        case "$smart_choice" in
+            1)
+                apply_smart_bdp_profile manual region
+                return 0
+                ;;
+            2)
+                apply_smart_bdp_profile speedtest region
+                return 0
+                ;;
+            3)
+                apply_smart_bdp_profile manual measured
+                return 0
+                ;;
+            4)
+                apply_smart_bdp_profile speedtest measured
                 return 0
                 ;;
             0)
@@ -4036,6 +4180,415 @@ preview_sysctl_candidate() {
         tail -n 9 "$candidate_file"
     fi
     log_info "确认应用后将自动创建快照，可从主菜单 4 回滚。"
+}
+
+build_serverspan_candidate_file() {
+    local use_case="$1"
+    local candidate_file="$2"
+    local apply_tcp_floor="${3:-1}"
+
+    local api_os cores threads ram nic disk_type disk_size_gb
+    local response_file payload api_status=0 enable_forwarding=0
+
+    api_os=$(map_serverspan_os)
+    cores=$(detect_serverspan_cores)
+    threads=$(detect_serverspan_threads)
+    ram=$(detect_serverspan_ram_gb)
+    nic=$(detect_serverspan_nic_speed)
+    disk_type=$(detect_serverspan_disk_type)
+    disk_size_gb=$(detect_serverspan_disk_size_gb)
+
+    SERVERSPAN_BUILD_SOURCE=""
+    SERVERSPAN_BUILD_USED_API=0
+    SERVERSPAN_BUILD_USED_WEB=0
+    SERVERSPAN_BUILD_USED_LOCAL=0
+    SERVERSPAN_BUILD_RAM="$ram"
+    SERVERSPAN_BUILD_THREADS="$threads"
+
+    log_info "硬件识别: os=${api_os}, cores=${cores}, threads=${threads}, ram=${ram}GB, nic=${nic}Mb/s, disk=${disk_type}, disk_size=${disk_size_gb}GB, kernel=${KERNEL_VERSION}"
+    log_info "说明: 外部模板只识别系统/硬件，不识别实际 RTT、BDP、协议组合和服务商隐藏调优。"
+
+    payload=$(cat <<EOF
+{"os":"${api_os}","cores":${cores},"threads":${threads},"ram":${ram},"nic":${nic},"disk_type":"${disk_type}","use_case":"${use_case}","disable_ipv6":false,"disable_ipv4":false,"enable_forwarding":$(bool_to_json "$enable_forwarding")}
+EOF
+)
+
+    response_file=$(mktemp)
+    if request_serverspan_web_generator "$api_os" "$cores" "$threads" "$ram" "$nic" "$disk_type" "$use_case" 0 0 "$enable_forwarding" "$candidate_file"; then
+        SERVERSPAN_BUILD_USED_WEB=1
+        SERVERSPAN_BUILD_SOURCE="Serverspan 网页生成器"
+        log_success "已使用 Serverspan 网页生成器结果"
+        log_info "连通性测试(Web生成器): HTTP=${SERVERSPAN_LAST_WEB_HTTP_CODE:-000}"
+    else
+        log_warn "网页生成器不可用 (HTTP ${SERVERSPAN_LAST_WEB_HTTP_CODE:-000})，尝试旧 API 端点"
+        request_serverspan_api "$payload" "$response_file" 1 || api_status=$?
+        log_info "连通性测试(API): HTTP=${SERVERSPAN_LAST_API_HTTP_CODE}"
+
+        if [[ "$api_status" -eq 0 ]]; then
+            if render_serverspan_sysctl_from_json "$response_file" "$candidate_file"; then
+                SERVERSPAN_BUILD_USED_API=1
+                SERVERSPAN_BUILD_SOURCE="Serverspan 旧 API"
+                log_success "已使用 Serverspan 旧 API 结果"
+            else
+                local err_msg
+                err_msg=$(extract_serverspan_error_message "$response_file")
+                log_warn "Serverspan API 解析失败: ${err_msg:-unknown}"
+            fi
+        elif [[ "$api_status" -eq 2 ]]; then
+            log_warn "Serverspan 旧 API 端点当前不可用 (HTTP ${SERVERSPAN_LAST_API_HTTP_CODE})"
+        else
+            log_warn "Serverspan 旧 API 请求失败 (HTTP ${SERVERSPAN_LAST_API_HTTP_CODE:-000})"
+        fi
+
+        if [[ "$SERVERSPAN_BUILD_USED_API" -ne 1 ]]; then
+            log_warn "将使用本地硬件模板回退"
+            write_local_detected_fallback_sysctl "$candidate_file" "$use_case" "$cores" "$threads" "$ram" "$nic" "$disk_type" "$disk_size_gb"
+            SERVERSPAN_BUILD_USED_LOCAL=1
+            SERVERSPAN_BUILD_SOURCE="本地硬件模板回退"
+        fi
+    fi
+    rm -f "$response_file"
+
+    if [[ "$apply_tcp_floor" == "1" ]]; then
+        if apply_auto_tcp_buffer_floor_if_needed "$candidate_file" "$use_case" "$ram" "$SERVERSPAN_BUILD_SOURCE"; then
+            SERVERSPAN_BUILD_SOURCE="${SERVERSPAN_BUILD_SOURCE} + AegisTune TCP floor"
+            log_info "检测到 ${use_case} 模板 TCP 缓冲偏保守，已按 ${ram}GB RAM 提升到 $(format_mib_from_bytes "$AUTO_BUFFER_TARGET_MAX") MiB"
+        fi
+    fi
+
+    [[ -s "$candidate_file" ]]
+}
+
+preview_unified_auto_candidate() {
+    local candidate_file="$1"
+    local decision_file="$2"
+    local use_case="$3"
+    local template_source="$4"
+    local bandwidth_mbps="$5"
+    local bandwidth_source="$6"
+    local rtt_ms="$7"
+    local rtt_source="$8"
+    local rtt_target="$9"
+
+    local baseline_meta_source baseline_meta_time baseline_summary
+    baseline_meta_source=$(grep '^source=' "$PROVIDER_BASELINE_META" 2>/dev/null | cut -d= -f2-)
+    baseline_meta_time=$(grep '^captured_at=' "$PROVIDER_BASELINE_META" 2>/dev/null | cut -d= -f2-)
+    [[ -z "$baseline_meta_source" ]] && baseline_meta_source="unknown"
+    [[ -z "$baseline_meta_time" ]] && baseline_meta_time="unknown"
+    baseline_summary="${baseline_meta_source} @ ${baseline_meta_time}"
+
+    log_section "统一自动决策预览"
+    log_info "Use Case: ${use_case}"
+    log_info "服务商基线: ${baseline_summary}"
+    log_info "外部模板: ${template_source}"
+    log_info "Smart BDP: bandwidth=${bandwidth_mbps}Mbps (${bandwidth_source}), rtt=${rtt_ms}ms (${rtt_source}:${rtt_target})"
+    echo "参数 | 最终值 | 来源 | 基线值 | 模板值 | BDP候选"
+    echo "-----|--------|------|--------|--------|--------"
+    awk -F'|' '
+        {
+            base=$4; tpl=$5; bdp=$6
+            if (base == "" || base ~ /^__/) base="-"
+            if (tpl == "") tpl="-"
+            if (bdp == "") bdp="-"
+            printf "%s | %s | %s | %s | %s | %s\n", $1, $2, $3, base, tpl, bdp
+        }
+    ' "$decision_file"
+    echo ""
+    log_info "未出现在上表中的其余模板参数会原样保留。"
+    log_info "确认应用后将自动创建快照，可从主菜单 4 回滚。"
+    echo ""
+    sed -n '1,24p' "$candidate_file"
+}
+
+write_unified_auto_candidate() {
+    local template_file="$1"
+    local bdp_file="$2"
+    local output_file="$3"
+    local decision_file="$4"
+
+    local baseline_block template_block bdp_block
+    baseline_block=$(mktemp)
+    template_block=$(mktemp)
+    bdp_block=$(mktemp)
+
+    cp "$template_file" "$output_file"
+    remove_sysctl_keys_from_file "$output_file" $(provider_tuning_keys)
+
+    {
+        echo ""
+        echo "# AegisTune unified auto tuning merge"
+        echo "# generated_at=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# preserved non-tracked template keys remain above"
+    } >> "$output_file"
+
+    : > "$decision_file"
+
+    local key baseline_value baseline_source_file baseline_label template_value bdp_value final_value final_source
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+
+        baseline_value=$(provider_tuning_kv_read "$key" "$PROVIDER_BASELINE_FILE")
+        baseline_source_file=$(provider_baseline_source_for_key "$key" || true)
+        baseline_label=$(render_provider_baseline_source_label "$baseline_source_file")
+        template_value=$(read_sysctl_value_from_file "$template_file" "$key" 2>/dev/null || true)
+        bdp_value=""
+        is_unified_auto_buffer_key "$key" && bdp_value=$(read_sysctl_value_from_file "$bdp_file" "$key" 2>/dev/null || true)
+        final_value=""
+        final_source=""
+
+        if is_unified_auto_buffer_key "$key"; then
+            if [[ -n "$bdp_value" ]]; then
+                final_value="$bdp_value"
+                final_source="Smart BDP 修正"
+            elif [[ -n "$template_value" ]]; then
+                final_value="$template_value"
+                final_source="外部模板"
+            elif provider_baseline_value_is_explicit "$baseline_value"; then
+                final_value="$baseline_value"
+                final_source="$baseline_label"
+            fi
+        elif is_unified_auto_template_priority_key "$key"; then
+            if [[ -n "$template_value" ]]; then
+                final_value="$template_value"
+                final_source="外部模板"
+            elif provider_baseline_value_is_explicit "$baseline_value"; then
+                final_value="$baseline_value"
+                final_source="$baseline_label"
+            fi
+        elif is_unified_auto_baseline_priority_key "$key"; then
+            if provider_baseline_value_is_explicit "$baseline_value"; then
+                final_value="$baseline_value"
+                final_source="$baseline_label"
+            elif [[ -n "$template_value" ]]; then
+                final_value="$template_value"
+                final_source="外部模板"
+            fi
+        else
+            if [[ -n "$template_value" ]]; then
+                final_value="$template_value"
+                final_source="外部模板"
+            elif provider_baseline_value_is_explicit "$baseline_value"; then
+                final_value="$baseline_value"
+                final_source="$baseline_label"
+            fi
+        fi
+
+        [[ -n "$final_value" ]] || continue
+        printf '%s|%s|%s|%s|%s|%s\n' "$key" "$final_value" "$final_source" "$baseline_value" "$template_value" "$bdp_value" >> "$decision_file"
+        case "$final_source" in
+            Smart\ BDP\ 修正)
+                printf '%s = %s\n' "$key" "$final_value" >> "$bdp_block"
+                ;;
+            外部模板)
+                printf '%s = %s\n' "$key" "$final_value" >> "$template_block"
+                ;;
+            *)
+                printf '%s = %s\n' "$key" "$final_value" >> "$baseline_block"
+                ;;
+        esac
+    done < <(provider_tuning_keys)
+
+    if [[ -s "$baseline_block" ]]; then
+        {
+            echo ""
+            echo "# source: preserved provider baseline"
+            cat "$baseline_block"
+        } >> "$output_file"
+    fi
+    if [[ -s "$template_block" ]]; then
+        {
+            echo ""
+            echo "# source: external template"
+            cat "$template_block"
+        } >> "$output_file"
+    fi
+    if [[ -s "$bdp_block" ]]; then
+        {
+            echo ""
+            echo "# source: smart bdp override"
+            cat "$bdp_block"
+        } >> "$output_file"
+    fi
+
+    rm -f "$baseline_block" "$template_block" "$bdp_block"
+}
+
+apply_unified_auto_profile() {
+    local bandwidth_mode="${1:-manual}"
+    local rtt_mode="${2:-region}"
+    local default_use_case="${3:-general}"
+    local use_case="$default_use_case"
+    local has_ipv6=0
+    local prefer_ipv4 ipv4_forward ipv6_forward
+    local bandwidth_mbps rtt_ms rtt_source rtt_target bandwidth_source region region_label
+    local template_candidate bdp_candidate merged_candidate decision_file
+    local ram_gb threads qdisc buffer_bytes buffer_mib ans
+
+    log_section "统一自动调优 (基线 + 模板 + Smart BDP)"
+    AUTO_BUFFER_FLOOR_APPLIED=0
+    AUTO_BUFFER_FLOOR_SOURCE=""
+    AUTO_BUFFER_ORIGINAL_MAX=""
+    AUTO_BUFFER_TARGET_MAX=""
+
+    detect_os
+    detect_kernel
+    detect_pkg_manager
+    ensure_provider_baseline
+    system_has_ipv6 && has_ipv6=1
+
+    read -p "Use Case (默认 general，输入 0 返回): " ans
+    if [[ "$ans" == "0" ]]; then
+        log_info "已取消统一自动调优，返回上层菜单"
+        return 0
+    fi
+    use_case="${ans:-$default_use_case}"
+    if ! is_valid_serverspan_use_case "$use_case"; then
+        log_error "无效 use_case: ${use_case}"
+        log_info "可用值: general/web/database/cache/network/api 等"
+        return 1
+    fi
+
+    if [[ "$bandwidth_mode" == "speedtest" ]]; then
+        bandwidth_mbps=$(measure_speedtest_upload_mbps) || {
+            log_warn "自动测速失败，切换为手动输入带宽"
+            bandwidth_mode="manual"
+        }
+        if [[ -n "$bandwidth_mbps" ]]; then
+            bandwidth_source="speedtest"
+            log_success "已检测上传带宽: ${bandwidth_mbps} Mbps"
+        fi
+    fi
+
+    if [[ "$bandwidth_mode" != "speedtest" ]]; then
+        while true; do
+            read -p "请输入上传带宽（Mbps，例如 500 / 1000 / 2000，输入 0 返回）: " bandwidth_mbps
+            if [[ "$bandwidth_mbps" == "0" ]]; then
+                log_info "已取消统一自动调优，返回上层菜单"
+                return 0
+            fi
+            if [[ "$bandwidth_mbps" =~ ^[0-9]+$ ]] && (( bandwidth_mbps > 0 )); then
+                break
+            fi
+            log_error "请输入有效的正整数带宽值"
+        done
+        bandwidth_source="manual"
+    fi
+
+    if [[ "$rtt_mode" == "measured" ]]; then
+        read -p "请输入 RTT 测试目标（域名或 IP，默认 1.1.1.1）: " rtt_target
+        [[ -z "$rtt_target" ]] && rtt_target="1.1.1.1"
+        rtt_ms=$(measure_ping_rtt_ms "$rtt_target") || {
+            log_warn "RTT 实测失败，改用地区近似 RTT"
+            rtt_mode="region"
+        }
+        if [[ -n "$rtt_ms" ]]; then
+            rtt_source="measured"
+            log_success "实测 RTT: ${rtt_ms} ms (target=${rtt_target})"
+        fi
+    fi
+
+    if [[ "$rtt_mode" != "measured" ]]; then
+        while true; do
+            echo ""
+            echo "请选择主要服务地区："
+            echo "1) 亚太地区（默认 RTT 50ms）"
+            echo "2) 美国/欧洲（默认 RTT 200ms）"
+            echo "0) 返回上层菜单"
+            read -p "请输入选择 [1/2/0]: " region
+            region="${region:-1}"
+            case "$region" in
+                1)
+                    region="asia"
+                    break
+                    ;;
+                2)
+                    region="overseas"
+                    break
+                    ;;
+                0)
+                    log_info "已取消统一自动调优，返回上层菜单"
+                    return 0
+                    ;;
+                *)
+                    log_error "无效选择"
+                    ;;
+            esac
+        done
+        rtt_ms=$(get_region_default_rtt_ms "$region")
+        region_label=$(get_region_label "$region")
+        rtt_source="region:${region}"
+        rtt_target="$region_label"
+        log_info "将使用地区近似 RTT: ${region_label} -> ${rtt_ms} ms"
+    fi
+
+    read -p "是否启用 IPv4 优先（不关闭 IPv6）? [Y/n]: " ans
+    [[ "$ans" =~ ^[Nn]$ ]] && prefer_ipv4="0" || prefer_ipv4="1"
+
+    read -p "是否开启 IPv4 转发? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && ipv4_forward="1" || ipv4_forward="0"
+
+    if [[ "$has_ipv6" == "1" ]]; then
+        read -p "是否开启 IPv6 转发? [y/N]: " ans
+        [[ "$ans" =~ ^[Yy]$ ]] && ipv6_forward="1" || ipv6_forward="0"
+    else
+        ipv6_forward="0"
+        log_info "未检测到可用 IPv6，已跳过 IPv6 转发提问"
+    fi
+
+    template_candidate=$(mktemp)
+    bdp_candidate=$(mktemp)
+    merged_candidate=$(mktemp)
+    decision_file=$(mktemp)
+
+    build_serverspan_candidate_file "$use_case" "$template_candidate" 0 || {
+        rm -f "$template_candidate" "$bdp_candidate" "$merged_candidate" "$decision_file"
+        log_error "构建外部模板候选失败"
+        return 1
+    }
+
+    ram_gb="${SERVERSPAN_BUILD_RAM:-$(detect_serverspan_ram_gb)}"
+    threads="${SERVERSPAN_BUILD_THREADS:-$(detect_serverspan_threads)}"
+    qdisc=$(read_sysctl_value_from_file "$template_candidate" "net.core.default_qdisc" 2>/dev/null || true)
+    [[ "$qdisc" == "cake" ]] || qdisc="fq"
+
+    buffer_bytes=$(calc_smart_bdp_buffer_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb" "$rtt_mode")
+    buffer_mib=$(format_mib_from_bytes "$buffer_bytes")
+    write_smart_bdp_sysctl "$bdp_candidate" "$bandwidth_mbps" "$bandwidth_source" "$rtt_ms" "$rtt_mode" "$rtt_target" "$buffer_bytes" "$ram_gb" "$threads" "$qdisc"
+    write_unified_auto_candidate "$template_candidate" "$bdp_candidate" "$merged_candidate" "$decision_file"
+    preview_unified_auto_candidate "$merged_candidate" "$decision_file" "$use_case" "$SERVERSPAN_BUILD_SOURCE" "$bandwidth_mbps" "$bandwidth_source" "$rtt_ms" "$rtt_source" "$rtt_target"
+    log_info "最终 TCP max 目标: ${buffer_mib} MiB"
+
+    read -p "是否应用以上统一自动配置? [Y/n]: " ans
+    if [[ "$ans" =~ ^[Nn]$ ]]; then
+        log_info "已取消应用，候选配置未写入系统"
+        rm -f "$template_candidate" "$bdp_candidate" "$merged_candidate" "$decision_file"
+        return 0
+    fi
+
+    create_config_snapshot "before_unified_auto_${use_case}_${bandwidth_source}_${rtt_mode}"
+    if [[ -f "$AUTO_MERGED_SYSCTL_FILE" ]]; then
+        cp "$AUTO_MERGED_SYSCTL_FILE" "${AUTO_MERGED_SYSCTL_FILE}.backup.$(date +%Y%m%d%H%M%S)"
+    fi
+    rm -f "$SERVERSPAN_SYSCTL_FILE" "$SMART_BDP_SYSCTL_FILE"
+    cp "$merged_candidate" "$AUTO_MERGED_SYSCTL_FILE"
+
+    write_forwarding_overlay "$ipv4_forward" "$ipv6_forward"
+    if [[ "$prefer_ipv4" == "1" ]]; then
+        apply_ipv4_preference_no_disable_ipv6 1
+    fi
+
+    sysctl -p "$AUTO_MERGED_SYSCTL_FILE" >/dev/null 2>&1 || true
+    if [[ -f "$FORWARDING_OVERLAY_FILE" ]]; then
+        sysctl -p "$FORWARDING_OVERLAY_FILE" >/dev/null 2>&1 || true
+    fi
+    sysctl --system >/dev/null 2>&1 || true
+
+    rm -f "$template_candidate" "$bdp_candidate" "$merged_candidate" "$decision_file"
+
+    log_success "统一自动调优已应用: $AUTO_MERGED_SYSCTL_FILE"
+    log_info "来源策略: 基线保留 + 外部模板补齐 + Smart BDP 修正 TCP buffer"
+    log_info "生效摘要: ${SERVERSPAN_BUILD_SOURCE}, ${bandwidth_source}/${bandwidth_mbps}Mbps, ${rtt_source}/${rtt_ms}ms => TCP max ${buffer_mib} MiB"
+    verify_installation
 }
 
 apply_serverspan_api_profile() {
@@ -4093,73 +4646,13 @@ apply_serverspan_api_profile() {
         fi
     fi
 
-    local api_os cores threads ram nic disk_type disk_size_gb
-    api_os=$(map_serverspan_os)
-    cores=$(detect_serverspan_cores)
-    threads=$(detect_serverspan_threads)
-    ram=$(detect_serverspan_ram_gb)
-    nic=$(detect_serverspan_nic_speed)
-    disk_type=$(detect_serverspan_disk_type)
-    disk_size_gb=$(detect_serverspan_disk_size_gb)
-
-    log_info "硬件识别: os=${api_os}, cores=${cores}, threads=${threads}, ram=${ram}GB, nic=${nic}Mb/s, disk=${disk_type}, disk_size=${disk_size_gb}GB, kernel=${KERNEL_VERSION}"
-    log_info "说明: Serverspan 仅基于系统/硬件生成模板，不会自动识别线路 RTT、BDP、业务协议或服务商隐藏调优。"
-
-    local enable_forwarding=0
-    if [[ "$ipv4_forward" == "1" || "$ipv6_forward" == "1" ]]; then
-        enable_forwarding=1
-    fi
-
-    local payload
-    payload=$(cat <<EOF
-{"os":"${api_os}","cores":${cores},"threads":${threads},"ram":${ram},"nic":${nic},"disk_type":"${disk_type}","use_case":"${use_case}","disable_ipv6":false,"disable_ipv4":false,"enable_forwarding":$(bool_to_json "$enable_forwarding")}
-EOF
-)
-
-    local response_file
-    response_file=$(mktemp)
     candidate_file=$(mktemp)
-    local api_status=0 used_api=0 used_web=0 used_local=0
-
-    if request_serverspan_web_generator "$api_os" "$cores" "$threads" "$ram" "$nic" "$disk_type" "$use_case" 0 0 "$enable_forwarding" "$candidate_file"; then
-        used_web=1
-        candidate_source="Serverspan 网页生成器"
-        log_success "已使用 Serverspan 网页生成器结果"
-        log_info "连通性测试(Web生成器): HTTP=${SERVERSPAN_LAST_WEB_HTTP_CODE:-000}"
-    else
-        log_warn "网页生成器不可用 (HTTP ${SERVERSPAN_LAST_WEB_HTTP_CODE:-000})，尝试旧 API 端点"
-        request_serverspan_api "$payload" "$response_file" 1 || api_status=$?
-        log_info "连通性测试(API): HTTP=${SERVERSPAN_LAST_API_HTTP_CODE}"
-
-        if [[ "$api_status" -eq 0 ]]; then
-            if render_serverspan_sysctl_from_json "$response_file" "$candidate_file"; then
-                used_api=1
-                candidate_source="Serverspan 旧 API"
-                log_success "已使用 Serverspan 旧 API 结果"
-            else
-                local err_msg
-                err_msg=$(extract_serverspan_error_message "$response_file")
-                log_warn "Serverspan API 解析失败: ${err_msg:-unknown}"
-            fi
-        elif [[ "$api_status" -eq 2 ]]; then
-            log_warn "Serverspan 旧 API 端点当前不可用 (HTTP ${SERVERSPAN_LAST_API_HTTP_CODE})"
-        else
-            log_warn "Serverspan 旧 API 请求失败 (HTTP ${SERVERSPAN_LAST_API_HTTP_CODE:-000})"
-        fi
-
-        if [[ "$used_api" -ne 1 ]]; then
-            log_warn "将使用本地硬件模板回退"
-            write_local_detected_fallback_sysctl "$candidate_file" "$use_case" "$cores" "$threads" "$ram" "$nic" "$disk_type" "$disk_size_gb"
-            used_local=1
-            candidate_source="本地硬件模板回退"
-        fi
-    fi
-    rm -f "$response_file"
-
-    if apply_auto_tcp_buffer_floor_if_needed "$candidate_file" "$use_case" "$ram" "$candidate_source"; then
-        candidate_source="${candidate_source} + AegisTune TCP floor"
-        log_info "检测到 ${use_case} 模板 TCP 缓冲偏保守，已按 ${ram}GB RAM 提升到 $(format_mib_from_bytes "$AUTO_BUFFER_TARGET_MAX") MiB"
-    fi
+    build_serverspan_candidate_file "$use_case" "$candidate_file" 1 || {
+        rm -f "$candidate_file"
+        log_error "构建 Serverspan 候选配置失败"
+        return 1
+    }
+    candidate_source="$SERVERSPAN_BUILD_SOURCE"
 
     if [[ "$non_interactive" != "1" ]]; then
         preview_sysctl_candidate "$candidate_file" "$candidate_source"
@@ -4176,7 +4669,7 @@ EOF
     if [[ -f "$SERVERSPAN_SYSCTL_FILE" ]]; then
         cp "$SERVERSPAN_SYSCTL_FILE" "${SERVERSPAN_SYSCTL_FILE}.backup.$(date +%Y%m%d%H%M%S)"
     fi
-    rm -f "$SMART_BDP_SYSCTL_FILE"
+    rm -f "$SMART_BDP_SYSCTL_FILE" "$AUTO_MERGED_SYSCTL_FILE"
     cp "$candidate_file" "$SERVERSPAN_SYSCTL_FILE"
     rm -f "$candidate_file"
 
@@ -4192,11 +4685,11 @@ EOF
     fi
     sysctl --system >/dev/null 2>&1 || true
 
-    if [[ "$used_api" == "1" ]]; then
+    if [[ "$SERVERSPAN_BUILD_USED_API" == "1" ]]; then
         log_success "Serverspan 旧 API 调优已应用: $SERVERSPAN_SYSCTL_FILE (use_case=${use_case})"
-    elif [[ "$used_web" == "1" ]]; then
+    elif [[ "$SERVERSPAN_BUILD_USED_WEB" == "1" ]]; then
         log_success "已应用 Serverspan 网页生成器调优: $SERVERSPAN_SYSCTL_FILE (use_case=${use_case})"
-    elif [[ "$used_local" == "1" ]]; then
+    elif [[ "$SERVERSPAN_BUILD_USED_LOCAL" == "1" ]]; then
         log_success "已应用本地硬件模板回退调优: $SERVERSPAN_SYSCTL_FILE (use_case=${use_case})"
     else
         log_warn "调优来源状态未知，但已写入配置文件: $SERVERSPAN_SYSCTL_FILE"
@@ -4400,9 +4893,14 @@ show_help() {
     echo "║    vendor-restore - 按服务商参数基线恢复                      ║"
     echo "║    corona    - 应用 DMIT Corona 参数 (默认/激进)             ║"
     echo "║    dmit-corona/an4-corona - 直接应用指定 Corona 参数          ║"
-    echo "║    api-sysctl - Serverspan 自动检测/预览/应用                 ║"
+    echo "║    auto-tune - 打开统一自动调优子菜单                         ║"
+    echo "║    auto-unified-manual - 统一自动调优: 手动带宽+地区 RTT      ║"
+    echo "║    auto-unified-speedtest - 统一自动调优: speedtest+地区 RTT  ║"
+    echo "║    auto-unified-rtt - 统一自动调优: 手动带宽+RTT 实测         ║"
+    echo "║    auto-unified-auto-rtt - 统一自动调优: speedtest+RTT 实测   ║"
+    echo "║    api-sysctl - 兼容模式: Serverspan 自动检测/预览/应用       ║"
     echo "║    api-general - 一键应用 Serverspan general 默认配置         ║"
-    echo "║    smart-bdp - 打开智能 BDP 自动调优子菜单                    ║"
+    echo "║    smart-bdp - 打开兼容模式: 智能 BDP 子菜单                  ║"
     echo "║    smart-bdp-manual - 手动带宽 + 地区估算 RTT                 ║"
     echo "║    smart-bdp-speedtest - speedtest + 地区估算 RTT            ║"
     echo "║    smart-bdp-rtt - 手动带宽 + RTT 实测                        ║"
@@ -4535,7 +5033,7 @@ show_main_menu() {
     printf "%b\n" "${CYAN}║    14) 快速补全缺失工具 (Docker Compose / FRPS)              ║"
     printf "%b\n" "${CYAN}║    15) Swap 管理                                             ║"
     printf "%b\n" "${CYAN}║    16) 检测服务商原生调优参数 (基线对比+来源扫描)            ║"
-    printf "%b\n" "${CYAN}║    17) 自动调优 (Serverspan / 智能 BDP)                      ║"
+    printf "%b\n" "${CYAN}║    17) 自动调优 (统一自动挡 / Serverspan / 智能 BDP)         ║"
     printf "%b\n" "${CYAN}║    18) 设置 IPv4 优先 (不关闭 IPv6)                          ║"
     printf "%b\n" "${CYAN}║    19) 重建服务商基线 (搜刮系统 sysctl 配置来源)             ║"
     printf "%b\n" "${CYAN}║    20) 按服务商基线恢复参数                                  ║"
@@ -4836,7 +5334,7 @@ main() {
             ;;
 
         smart-bdp|bdp-auto|smart-auto)
-            show_auto_tuning_menu
+            show_smart_bdp_menu
             ;;
 
         smart-bdp-manual|bdp-manual)
@@ -4853,6 +5351,22 @@ main() {
 
         smart-bdp-auto-rtt|bdp-auto-rtt)
             apply_smart_bdp_profile speedtest measured
+            ;;
+
+        auto-unified-manual|auto-merge-manual|unified-manual)
+            apply_unified_auto_profile manual region
+            ;;
+
+        auto-unified-speedtest|auto-merge-speedtest|unified-speedtest)
+            apply_unified_auto_profile speedtest region
+            ;;
+
+        auto-unified-rtt|auto-merge-rtt|unified-rtt)
+            apply_unified_auto_profile manual measured
+            ;;
+
+        auto-unified-auto-rtt|auto-merge-auto-rtt|unified-auto-rtt)
+            apply_unified_auto_profile speedtest measured
             ;;
 
         auto-tune|auto-tuning)

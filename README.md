@@ -27,6 +27,11 @@ sudo ./zhizhishu-net-opt.sh status
 - 独立管理 `bpftune`、`TCP Brutal`、`brutal-nginx`
 - 内置 `DMIT Corona` 默认/激进两档参数
 - 检测服务商原生 `sysctl` 配置，并支持重建/恢复基线
+- 新增 `统一自动调优`：
+  - 尽量识别并保留原厂/服务商基线
+  - 用 `Serverspan / 本地模板` 补齐通用参数
+  - 用 `Smart BDP` 专门决定 TCP buffer
+  - 应用前先展示“最终值 + 来源 + 基线值 + 模板值 + BDP 候选”
 - 支持 `Serverspan` 自动调优，失败时自动回退到本地模板
 - 自动挡会识别 `Serverspan` 过保守的 TCP 缓冲，并按内存/场景做本地修正
 - 新增 `智能 BDP 自动调优`：
@@ -92,6 +97,28 @@ https://raw.githubusercontent.com/MvsCode/frps-onekey/master/install-frps.sh
 
 这意味着 FRPS 这部分属于“第三方安装器集成”，不是 AegisTune 自己重写的安装逻辑。
 
+## Unified Auto Mode
+
+默认推荐使用的是 `统一自动调优`，不是单独的 `Serverspan` 或单独的 `Smart BDP`。
+
+它的决策顺序是：
+
+1. 先读取当前机器可识别的 `原厂/服务商基线`
+2. 再生成 `Serverspan` 模板；如果外站不可用，则退回本地硬件模板
+3. 最后用 `Smart BDP` 只接管 TCP buffer 相关项
+4. 应用前展示决策预览表，明确标出：
+   - 最终值
+   - 来源
+   - 基线值
+   - 模板值
+   - BDP 候选值
+
+这样做的目的，是避免只信任某一个来源：
+
+- 尽量保留服务商/镜像本来的合理参数
+- 不丢掉外部模板对通用项的补齐
+- 不再盲信 `Serverspan general` 这类过小 TCP buffer
+
 ## Serverspan Auto Mode
 
 `Serverspan general/moderate` 当前返回的 TCP 缓冲偏保守，常见会落在 `4-8 MiB` 档。
@@ -144,6 +171,11 @@ sudo ./zhizhishu-net-opt.sh tools
 sudo ./zhizhishu-net-opt.sh compose-install
 sudo ./zhizhishu-net-opt.sh frps-install
 sudo ./zhizhishu-net-opt.sh frps-uninstall
+sudo ./zhizhishu-net-opt.sh auto-tune
+sudo ./zhizhishu-net-opt.sh auto-unified-manual
+sudo ./zhizhishu-net-opt.sh auto-unified-speedtest
+sudo ./zhizhishu-net-opt.sh auto-unified-rtt
+sudo ./zhizhishu-net-opt.sh auto-unified-auto-rtt
 sudo ./zhizhishu-net-opt.sh smart-bdp
 sudo ./zhizhishu-net-opt.sh smart-bdp-manual
 sudo ./zhizhishu-net-opt.sh smart-bdp-speedtest
