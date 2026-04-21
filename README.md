@@ -136,53 +136,23 @@ AegisTune is a menu-driven Linux network tuning assistant built around `zhizhish
 - 可用的软件包管理器（`apt` / `apk` / 对应 RPM 系工具）
 - 能访问外部网络时，脚本可尝试获取在线资源；拿不到时会进入回退链路
 
-## Main Menu Overview
+## Quick Start
 
-当前主菜单结构如下：
-
-- `1)` 交互式安装（FQ/CAKE，不安装 `bpftune`）
-- `2)` 查看当前网络状态
-- `3)` 卸载网络优化
-- `4)` 快照管理
-- `5)` 扩展管理（`bpftune` / `Brutal` / `brutal-nginx`）
-- `6)` 应用 DMIT Corona 参数
-- `7-13)` 安全检查
-- `14-19)` 系统维护（Swap / 服务商基线 / Serverspan / IPv4 优先）
-
-## CLI Examples
+只需要三步：
 
 ```bash
-sudo bash zhizhishu-net-opt.sh
-sudo bash zhizhishu-net-opt.sh status
-sudo bash zhizhishu-net-opt.sh install
-sudo bash zhizhishu-net-opt.sh uninstall
+git clone https://github.com/zhizhishu/AegisTune.git
+cd AegisTune
+chmod +x zhizhishu-net-opt.sh
+sudo ./zhizhishu-net-opt.sh
+```
 
-sudo bash zhizhishu-net-opt.sh snapshot
-sudo bash zhizhishu-net-opt.sh rollback
-sudo bash zhizhishu-net-opt.sh snapshots
+脚本启动后直接使用交互菜单即可。
 
-sudo bash zhizhishu-net-opt.sh extensions
-sudo bash zhizhishu-net-opt.sh bpftune-rm
-sudo bash zhizhishu-net-opt.sh brutal
-sudo bash zhizhishu-net-opt.sh brutal-rm
-sudo bash zhizhishu-net-opt.sh brutal-ng
+如果只想先看当前状态：
 
-sudo bash zhizhishu-net-opt.sh corona
-sudo bash zhizhishu-net-opt.sh dmit-corona
-sudo bash zhizhishu-net-opt.sh an4-corona
-
-sudo bash zhizhishu-net-opt.sh vendor-check
-sudo bash zhizhishu-net-opt.sh vendor-rescan
-sudo bash zhizhishu-net-opt.sh vendor-restore
-
-sudo bash zhizhishu-net-opt.sh api-sysctl
-sudo bash zhizhishu-net-opt.sh api-general
-sudo bash zhizhishu-net-opt.sh ipv4-prefer
-
-sudo bash zhizhishu-net-opt.sh ssh
-sudo bash zhizhishu-net-opt.sh ssh-off
-sudo bash zhizhishu-net-opt.sh fail2ban
-sudo bash zhizhishu-net-opt.sh fail2ban-rm
+```bash
+sudo ./zhizhishu-net-opt.sh status
 ```
 
 ## Safety Notes
