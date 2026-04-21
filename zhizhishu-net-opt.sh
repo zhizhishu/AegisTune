@@ -182,6 +182,9 @@ SNAPSHOT_ROOT="/var/backups/zhizhishu-net-opt"
 PROVIDER_BASELINE_FILE="${SNAPSHOT_ROOT}/provider-baseline.sysctl"
 PROVIDER_BASELINE_META="${SNAPSHOT_ROOT}/provider-baseline.meta"
 PROVIDER_BASELINE_SOURCEMAP="${SNAPSHOT_ROOT}/provider-baseline-sources.map"
+STATUS_CACHE_ROOT="/tmp/zhizhishu-net-opt"
+PUBLIC_IPV4_CACHE="${STATUS_CACHE_ROOT}/public_ipv4.cache"
+PUBLIC_IPV6_CACHE="${STATUS_CACHE_ROOT}/public_ipv6.cache"
 SERVERSPAN_API_URL="https://www.serverspan.com/tools/api/sysctl_api.php"
 SERVERSPAN_WEB_URL="https://www.serverspan.com/en/tools/sysctl"
 SERVERSPAN_SYSCTL_FILE="/etc/sysctl.d/99-zhizhishu-serverspan.conf"
@@ -2101,40 +2104,67 @@ print_system_status_card() {
     fi
     render_status_panel_row "$cc_cell" "$qdisc_cell"
 
-    local ipv4_addr ipv4_forward ipv6_addr ipv6_forward ipv4_addr_short ipv6_addr_short
+    local ipv4_addr ipv4_public ipv4_forward ipv6_addr ipv6_public ipv6_forward
+    local ipv4_addr_short ipv4_public_short ipv6_addr_short ipv6_public_short
     ipv4_addr=$(get_primary_ipv4)
+    ipv4_public=$(get_public_ipv4 2>/dev/null || true)
     ipv4_forward=$(get_ipv4_forwarding_status)
     ipv6_addr=$(get_primary_ipv6)
+    ipv6_public=$(get_public_ipv6 2>/dev/null || true)
     ipv6_forward=$(get_ipv6_forwarding_status)
-    ipv4_addr_short=$(truncate_status_value "${ipv4_addr:-未检测到}" 15)
-    ipv6_addr_short=$(truncate_status_value "${ipv6_addr:-未检测到}" 15)
+    ipv4_addr_short=$(truncate_status_value "${ipv4_addr:-未检测到}" 13)
+    ipv4_public_short=$(truncate_status_value "${ipv4_public:-未获取}" 13)
+    ipv6_addr_short=$(truncate_status_value "${ipv6_addr:-未检测到}" 13)
+    ipv6_public_short=$(truncate_status_value "${ipv6_public:-未获取}" 13)
 
-    local ipv4_cell ipv4_forward_cell ipv6_cell ipv6_forward_cell
-    if [[ -n "$ipv4_addr" ]]; then
-        ipv4_cell="${GREEN}IPv4: ${ipv4_addr_short}${NC}"
+    local ipv4_public_cell ipv4_forward_cell ipv6_public_cell ipv6_forward_cell
+    local ipv4_local_cell ipv6_local_cell
+    if [[ -n "$ipv4_public" ]]; then
+        ipv4_public_cell="${GREEN}IPv4公网: ${ipv4_public_short}${NC}"
     else
-        ipv4_cell="${YELLOW}IPv4: 未检测到${NC}"
+        ipv4_public_cell="${YELLOW}IPv4公网: 未获取${NC}"
     fi
     if [[ "$ipv4_forward" == "已启用" ]]; then
-        ipv4_forward_cell="${GREEN}IPv4转发: 已启用 ✓${NC}"
+        ipv4_forward_cell="${GREEN}IPv4转发: 开 ✓${NC}"
     else
-        ipv4_forward_cell="${YELLOW}IPv4转发: 未启用${NC}"
+        ipv4_forward_cell="${YELLOW}IPv4转发: 关${NC}"
     fi
-    render_status_panel_row "$ipv4_cell" "$ipv4_forward_cell"
+    render_status_panel_row "$ipv4_public_cell" "$ipv4_forward_cell"
 
-    if [[ -n "$ipv6_addr" ]]; then
-        ipv6_cell="${GREEN}IPv6: ${ipv6_addr_short}${NC}"
+    if [[ -n "$ipv4_addr" ]]; then
+        if is_private_ipv4 "$ipv4_addr"; then
+            ipv4_local_cell="${YELLOW}IPv4本机: ${ipv4_addr_short}${NC}"
+        else
+            ipv4_local_cell="${GREEN}IPv4本机: ${ipv4_addr_short}${NC}"
+        fi
     else
-        ipv6_cell="${YELLOW}IPv6: 未检测到${NC}"
+        ipv4_local_cell="${YELLOW}IPv4本机: 未检测到${NC}"
+    fi
+
+    if [[ -n "$ipv6_public" ]]; then
+        ipv6_public_cell="${GREEN}IPv6公网: ${ipv6_public_short}${NC}"
+    else
+        ipv6_public_cell="${YELLOW}IPv6公网: 未获取${NC}"
     fi
     if [[ "$ipv6_forward" == "已启用" ]]; then
-        ipv6_forward_cell="${GREEN}IPv6转发: 已启用 ✓${NC}"
+        ipv6_forward_cell="${GREEN}IPv6转发: 开 ✓${NC}"
     elif [[ "$ipv6_forward" == "未检测到" ]]; then
         ipv6_forward_cell="${YELLOW}IPv6转发: 未检测到${NC}"
     else
-        ipv6_forward_cell="${YELLOW}IPv6转发: 未启用${NC}"
+        ipv6_forward_cell="${YELLOW}IPv6转发: 关${NC}"
     fi
-    render_status_panel_row "$ipv6_cell" "$ipv6_forward_cell"
+    render_status_panel_row "$ipv6_public_cell" "$ipv6_forward_cell"
+
+    if [[ -n "$ipv6_addr" ]]; then
+        if is_global_ipv6 "$ipv6_addr"; then
+            ipv6_local_cell="${GREEN}IPv6本机: ${ipv6_addr_short}${NC}"
+        else
+            ipv6_local_cell="${YELLOW}IPv6本机: ${ipv6_addr_short}${NC}"
+        fi
+    else
+        ipv6_local_cell="${YELLOW}IPv6本机: 未检测到${NC}"
+    fi
+    render_status_panel_row "$ipv4_local_cell" "$ipv6_local_cell"
     echo -e "${CYAN}├────────────────────────┼─────────────────────────┤${NC}"
 
     local bpftune_cell tcp_buffer_cell brutal_cell nginx_cell
@@ -2523,6 +2553,26 @@ get_primary_ipv4() {
     echo "$ipv4_addr"
 }
 
+is_private_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^10\. ]] && return 0
+    [[ "$ip" =~ ^127\. ]] && return 0
+    [[ "$ip" =~ ^169\.254\. ]] && return 0
+    [[ "$ip" =~ ^192\.168\. ]] && return 0
+    [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && return 0
+    [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]] && return 0
+    [[ "$ip" =~ ^0\. ]] && return 0
+    [[ "$ip" =~ ^255\. ]] && return 0
+    return 1
+}
+
+is_public_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    is_private_ipv4 "$ip" && return 1
+    return 0
+}
+
 get_primary_ipv6() {
     local ipv6_addr=""
     if command -v ip >/dev/null 2>&1; then
@@ -2532,6 +2582,90 @@ get_primary_ipv6() {
         fi
     fi
     echo "$ipv6_addr"
+}
+
+is_global_ipv6() {
+    local ip="${1,,}"
+    [[ -n "$ip" && "$ip" == *:* ]] || return 1
+    [[ "$ip" == "::1" ]] && return 1
+    [[ "$ip" == fe80:* ]] && return 1
+    [[ "$ip" == fc* || "$ip" == fd* ]] && return 1
+    [[ "$ip" == 2001:db8:* ]] && return 1
+    return 0
+}
+
+read_cached_status_value() {
+    local cache_file="$1"
+    local ttl="${2:-60}"
+
+    [[ -f "$cache_file" ]] || return 1
+
+    local timestamp value now
+    timestamp=$(sed -n '1p' "$cache_file" 2>/dev/null)
+    value=$(sed -n '2p' "$cache_file" 2>/dev/null)
+    now=$(date +%s)
+
+    [[ "$timestamp" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "$value" ]] || return 1
+    (( now - timestamp <= ttl )) || return 1
+
+    printf '%s\n' "$value"
+}
+
+write_cached_status_value() {
+    local cache_file="$1"
+    local value="$2"
+
+    mkdir -p "$STATUS_CACHE_ROOT"
+    {
+        date +%s
+        printf '%s\n' "$value"
+    } > "$cache_file"
+}
+
+get_public_ipv4() {
+    local cached value
+    cached=$(read_cached_status_value "$PUBLIC_IPV4_CACHE" 60 2>/dev/null || true)
+    if [[ -n "$cached" ]]; then
+        printf '%s\n' "$cached"
+        return 0
+    fi
+
+    command -v curl >/dev/null 2>&1 || return 1
+
+    for url in "https://api.ipify.org" "https://ipv4.icanhazip.com"; do
+        value=$(curl -4 -fsS --connect-timeout 1 --max-time 2 "$url" 2>/dev/null | tr -d '\r\n[:space:]')
+        if is_public_ipv4 "$value"; then
+            write_cached_status_value "$PUBLIC_IPV4_CACHE" "$value"
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+get_public_ipv6() {
+    local cached value
+    cached=$(read_cached_status_value "$PUBLIC_IPV6_CACHE" 60 2>/dev/null || true)
+    if [[ -n "$cached" ]]; then
+        printf '%s\n' "$cached"
+        return 0
+    fi
+
+    system_has_ipv6 || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+
+    for url in "https://api64.ipify.org" "https://ipv6.icanhazip.com"; do
+        value=$(curl -6 -fsS --connect-timeout 1 --max-time 3 "$url" 2>/dev/null | tr -d '\r\n[:space:]')
+        if is_global_ipv6 "$value"; then
+            write_cached_status_value "$PUBLIC_IPV6_CACHE" "$value"
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 truncate_status_value() {
