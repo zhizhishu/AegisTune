@@ -192,6 +192,10 @@ FORWARDING_OVERLAY_FILE="/etc/sysctl.d/99-zhizhishu-forwarding.conf"
 PROVIDER_RESTORE_FILE="/etc/sysctl.d/99-zhizhishu-provider-baseline-restore.conf"
 SERVERSPAN_LAST_API_HTTP_CODE=""
 SERVERSPAN_LAST_WEB_HTTP_CODE=""
+AUTO_BUFFER_FLOOR_APPLIED=0
+AUTO_BUFFER_FLOOR_SOURCE=""
+AUTO_BUFFER_ORIGINAL_MAX=""
+AUTO_BUFFER_TARGET_MAX=""
 
 # ============ 工具函数 ============
 
@@ -3302,6 +3306,125 @@ calc_fallback_buffer_max_bytes() {
     fi
 }
 
+format_mib_from_bytes() {
+    local value="$1"
+    awk -v v="$value" 'BEGIN {printf "%.1f", v/1024/1024}'
+}
+
+read_sysctl_value_from_file() {
+    local file="$1"
+    local key="$2"
+    [[ -f "$file" ]] || return 1
+    awk -F= -v key="$key" '
+        $0 !~ /^[[:space:]]*#/ {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+            if ($1 == key) {
+                value=$2
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                result=value
+            }
+        }
+        END {
+            if (result != "") print result
+        }
+    ' "$file"
+}
+
+calc_auto_buffer_floor_bytes() {
+    local use_case="$1"
+    local ram_gb="$2"
+    local floor_bytes
+
+    case "$use_case" in
+        network|api|fileserver|media|mail|game|blockchain|web)
+            if (( ram_gb <= 1 )); then
+                floor_bytes=41943040
+            elif (( ram_gb <= 2 )); then
+                floor_bytes=41943040
+            elif (( ram_gb <= 4 )); then
+                floor_bytes=67108864
+            elif (( ram_gb <= 8 )); then
+                floor_bytes=100663296
+            elif (( ram_gb <= 16 )); then
+                floor_bytes=134217728
+            else
+                floor_bytes=268435456
+            fi
+            ;;
+        *)
+            if (( ram_gb <= 1 )); then
+                floor_bytes=16777216
+            elif (( ram_gb <= 2 )); then
+                floor_bytes=33554432
+            elif (( ram_gb <= 4 )); then
+                floor_bytes=50331648
+            elif (( ram_gb <= 16 )); then
+                floor_bytes=67108864
+            else
+                floor_bytes=134217728
+            fi
+            ;;
+    esac
+
+    echo "$floor_bytes"
+}
+
+apply_auto_tcp_buffer_floor_if_needed() {
+    local file="$1"
+    local use_case="$2"
+    local ram_gb="$3"
+    local source_label="$4"
+    local current_max target_max mid_buf def_buf
+
+    AUTO_BUFFER_FLOOR_APPLIED=0
+    AUTO_BUFFER_FLOOR_SOURCE=""
+    AUTO_BUFFER_ORIGINAL_MAX=""
+    AUTO_BUFFER_TARGET_MAX=""
+
+    current_max=$(read_sysctl_value_from_file "$file" "net.core.rmem_max" 2>/dev/null || true)
+    [[ "$current_max" =~ ^[0-9]+$ ]] || return 1
+
+    target_max=$(calc_auto_buffer_floor_bytes "$use_case" "$ram_gb")
+    [[ "$target_max" =~ ^[0-9]+$ ]] || return 1
+
+    if (( current_max >= target_max )); then
+        return 1
+    fi
+
+    mid_buf=$((target_max / 4))
+    (( mid_buf < 1048576 )) && mid_buf=1048576
+    def_buf=$((target_max / 8))
+    (( def_buf < 1048576 )) && def_buf=1048576
+    (( def_buf > 16777216 )) && def_buf=16777216
+
+    sed -i -E \
+        -e '/^net\.core\.rmem_max[[:space:]]*=.*/d' \
+        -e '/^net\.core\.wmem_max[[:space:]]*=.*/d' \
+        -e '/^net\.core\.rmem_default[[:space:]]*=.*/d' \
+        -e '/^net\.core\.wmem_default[[:space:]]*=.*/d' \
+        -e '/^net\.ipv4\.tcp_rmem[[:space:]]*=.*/d' \
+        -e '/^net\.ipv4\.tcp_wmem[[:space:]]*=.*/d' \
+        "$file"
+
+    cat >> "$file" <<EOF
+# AegisTune adjusted TCP buffer floor
+# source=${source_label}, use_case=${use_case}, ram=${ram_gb}GB
+# original net.core.rmem_max = ${current_max}
+net.core.rmem_max = ${target_max}
+net.core.wmem_max = ${target_max}
+net.core.rmem_default = ${def_buf}
+net.core.wmem_default = ${def_buf}
+net.ipv4.tcp_rmem = 16384 ${mid_buf} ${target_max}
+net.ipv4.tcp_wmem = 16384 ${mid_buf} ${target_max}
+EOF
+
+    AUTO_BUFFER_FLOOR_APPLIED=1
+    AUTO_BUFFER_FLOOR_SOURCE="$source_label"
+    AUTO_BUFFER_ORIGINAL_MAX="$current_max"
+    AUTO_BUFFER_TARGET_MAX="$target_max"
+    return 0
+}
+
 write_local_detected_fallback_sysctl() {
     local output_file="$1"
     local use_case="$2"
@@ -3442,10 +3565,18 @@ preview_sysctl_candidate() {
 
     log_section "自动检测配置预览"
     log_info "来源: ${source_label}"
+    if [[ "$AUTO_BUFFER_FLOOR_APPLIED" == "1" && "$AUTO_BUFFER_ORIGINAL_MAX" =~ ^[0-9]+$ && "$AUTO_BUFFER_TARGET_MAX" =~ ^[0-9]+$ ]]; then
+        log_warn "AegisTune 已修正过保守的 TCP 缓冲: $(format_mib_from_bytes "$AUTO_BUFFER_ORIGINAL_MAX") MiB -> $(format_mib_from_bytes "$AUTO_BUFFER_TARGET_MAX") MiB"
+    fi
     total_lines=$(wc -l < "$candidate_file" 2>/dev/null || echo 0)
     sed -n '1,28p' "$candidate_file"
     if (( total_lines > 28 )); then
         echo "... (共 ${total_lines} 行，已截取前 28 行预览)"
+    fi
+    if [[ "$AUTO_BUFFER_FLOOR_APPLIED" == "1" ]]; then
+        echo ""
+        echo "# --- AegisTune TCP buffer override ---"
+        tail -n 9 "$candidate_file"
     fi
     log_info "确认应用后将自动创建快照，可从主菜单 4 回滚。"
 }
@@ -3568,6 +3699,11 @@ EOF
     fi
     rm -f "$response_file"
 
+    if apply_auto_tcp_buffer_floor_if_needed "$candidate_file" "$use_case" "$ram" "$candidate_source"; then
+        candidate_source="${candidate_source} + AegisTune TCP floor"
+        log_info "检测到 ${use_case} 模板 TCP 缓冲偏保守，已按 ${ram}GB RAM 提升到 $(format_mib_from_bytes "$AUTO_BUFFER_TARGET_MAX") MiB"
+    fi
+
     if [[ "$non_interactive" != "1" ]]; then
         preview_sysctl_candidate "$candidate_file" "$candidate_source"
         local confirm_apply
@@ -3606,6 +3742,10 @@ EOF
         log_success "已应用本地硬件模板回退调优: $SERVERSPAN_SYSCTL_FILE (use_case=${use_case})"
     else
         log_warn "调优来源状态未知，但已写入配置文件: $SERVERSPAN_SYSCTL_FILE"
+    fi
+
+    if [[ "$AUTO_BUFFER_FLOOR_APPLIED" == "1" && "$AUTO_BUFFER_ORIGINAL_MAX" =~ ^[0-9]+$ && "$AUTO_BUFFER_TARGET_MAX" =~ ^[0-9]+$ ]]; then
+        log_info "AegisTune TCP 缓冲修正已生效: $(format_mib_from_bytes "$AUTO_BUFFER_ORIGINAL_MAX") MiB -> $(format_mib_from_bytes "$AUTO_BUFFER_TARGET_MAX") MiB"
     fi
 
     local live_rmem_max live_rmem_mib

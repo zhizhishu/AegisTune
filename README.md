@@ -28,6 +28,7 @@ sudo ./zhizhishu-net-opt.sh status
 - 内置 `DMIT Corona` 默认/激进两档参数
 - 检测服务商原生 `sysctl` 配置，并支持重建/恢复基线
 - 支持 `Serverspan` 自动调优，失败时自动回退到本地模板
+- 自动挡会识别 `Serverspan` 过保守的 TCP 缓冲，并按内存/场景做本地修正
 - 支持 `IPv4 优先` 设置，不强制关闭 IPv6
 - 集成 SSH / Fail2ban / 端口 / cron / authorized_keys 安全检查
 - 新增常用缺失工具补全：
@@ -85,6 +86,19 @@ https://raw.githubusercontent.com/MvsCode/frps-onekey/master/install-frps.sh
 - `uninstall`
 
 这意味着 FRPS 这部分属于“第三方安装器集成”，不是 AegisTune 自己重写的安装逻辑。
+
+## Serverspan Auto Mode
+
+`Serverspan general/moderate` 当前返回的 TCP 缓冲偏保守，常见会落在 `4-8 MiB` 档。
+
+AegisTune 的自动挡现在会：
+
+- 先保留 `Serverspan` 生成的其余 `sysctl` 参数
+- 读取返回的 `net.core.rmem_max`
+- 如果低于脚本的自动最低档，则仅覆盖 TCP 缓冲相关项
+- 在预览和应用日志中显示“原值 -> 修正值”
+
+这样做的目的，是避免自动挡在 `8GB`、`12GB`、`16GB` 这类机器上仍然落到 `3.9 MiB` 一类明显过小的窗口。
 
 ## Safety Notes
 
