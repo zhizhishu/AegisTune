@@ -1345,6 +1345,21 @@ remove_brutal_nginx_module() {
 
 # ============ Fail2ban 管理 (SSH 防暴力) ============
 
+# 服务没起来时，别用"状态未知"含糊带过——把真实日志和根因/修复建议摆出来。
+fail2ban_report_failure() {
+    log_info "服务未 active，诊断信息（最近日志）："
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u fail2ban --no-pager -n 15 2>/dev/null | sed 's/^/    /' || true
+    fi
+    if [[ -f /var/log/fail2ban.log ]]; then
+        tail -n 15 /var/log/fail2ban.log 2>/dev/null | sed 's/^/    /' || true
+    fi
+    log_info "常见根因与修复："
+    log_info "  1) cloud/精简镜像无 /var/log/auth.log → [sshd] 用 backend = systemd（读 journald）。"
+    log_info "  2) fail2ban.service 设了 RestartPreventExitStatus=255，首启失败不自愈 → 修好配置后手动 restart。"
+    log_info "  3) 手动排查具体报错: fail2ban-client -x start"
+}
+
 install_fail2ban_basic() {
     log_section "配置 Fail2ban (SSH 防护)"
     detect_os
@@ -1379,6 +1394,14 @@ install_fail2ban_basic() {
         return 1
     fi
 
+    # 后端自适应：systemd 主机读 journald——cloud/精简镜像用 systemd-journald 且没装 rsyslog，
+    # 根本没有 /var/log/auth.log，文件后端会报 "Have not found any log file for sshd jail" 启动失败。
+    # 非 systemd（Alpine/OpenRC 等）保持 auto + 文件后端，交给 fail2ban 包内 paths 默认值。
+    local f2b_backend="auto"
+    if [[ "$(get_service_manager)" == "systemd" ]]; then
+        f2b_backend="systemd"
+    fi
+
     cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 ::1
@@ -1388,22 +1411,33 @@ bantime.factor = 1
 bantime.maxtime = 30d
 findtime = 7d
 maxretry = 3
-backend = auto
+backend = $f2b_backend
 
 [sshd]
 enabled = true
 port = $ssh_port,22
 mode = aggressive
+backend = $f2b_backend
 EOF
 
-    service_action_any restart rsyslog || true
+    # 只有文件后端才需要 rsyslog 产出 auth.log；systemd 后端直接读 journald，无需 rsyslog。
+    if [[ "$f2b_backend" != "systemd" ]]; then
+        service_action_any restart rsyslog || true
+    fi
     service_enable_any fail2ban || true
-    service_action_any restart fail2ban || true
+    service_action_any restart fail2ban || service_action_any start fail2ban || true
 
+    # 落地验证：真查服务是否 active，失败给可诊断原因，不再"状态未知"含糊带过。
     if service_is_active_any fail2ban; then
-        log_success "Fail2ban 已启用 (SSH 端口: $ssh_port)"
+        if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client status sshd >/dev/null 2>&1; then
+            log_success "Fail2ban 已启用并加载 sshd jail (SSH 端口: $ssh_port，后端: $f2b_backend)"
+        else
+            log_success "Fail2ban 服务已运行 (SSH 端口: $ssh_port，后端: $f2b_backend)"
+        fi
     else
-        log_warn "Fail2ban 启动状态未知，请检查服务日志"
+        log_error "Fail2ban 启动失败（服务未 active，后端: $f2b_backend）"
+        fail2ban_report_failure
+        return 1
     fi
 }
 
@@ -1413,6 +1447,468 @@ remove_fail2ban_basic() {
     service_disable_any fail2ban || true
     rm -f /etc/fail2ban/jail.local
     log_success "Fail2ban 已停用并移除自定义配置"
+}
+
+# ============ Fail2ban 白名单 (ignoreip) 安全管理 ============
+
+# 严格校验 IPv4/IPv6/CIDR；通过 return 0，非法 return 1
+fail2ban_validate_ip() {
+    local raw="$1"
+    local addr prefix
+
+    case "$raw" in
+        ""|*" "*|*$'\t'*|*$'\n'*) return 1 ;;
+    esac
+
+    if [[ "$raw" == */* ]]; then
+        addr="${raw%/*}"
+        prefix="${raw#*/}"
+        case "$prefix" in
+            ""|*[!0-9]*) return 1 ;;
+        esac
+        # 拒绝前导零以外的异常（纯数字即可，范围稍后判）
+        if [[ "$prefix" != "$raw" ]] && [[ "$raw" != */*/* ]]; then
+            :
+        else
+            # 多于一个 /
+            [[ "$raw" == */*/* ]] && return 1
+        fi
+        # 恰好一个 /
+        local slash_rest="${raw#*/}"
+        [[ "$slash_rest" == */* ]] && return 1
+    else
+        addr="$raw"
+        prefix=""
+    fi
+
+    [[ -n "$addr" ]] || return 1
+
+    # IPv4
+    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        local a="${BASH_REMATCH[1]}"
+        local b="${BASH_REMATCH[2]}"
+        local c="${BASH_REMATCH[3]}"
+        local d="${BASH_REMATCH[4]}"
+        if (( 10#$a > 255 || 10#$b > 255 || 10#$c > 255 || 10#$d > 255 )); then
+            return 1
+        fi
+        if [[ -n "$prefix" ]] && (( 10#$prefix > 32 )); then
+            return 1
+        fi
+        return 0
+    fi
+
+    # IPv6：仅允许 hex 与冒号，且至少一个冒号
+    case "$addr" in
+        *[!0-9A-Fa-f:]* ) return 1 ;;
+    esac
+    [[ "$addr" == *:* ]] || return 1
+    # 三个及以上连续冒号是畸形 IPv6，直接拒
+    case "$addr" in *:::*) return 1 ;; esac
+
+    # 至多一处 ::
+    local dc=0
+    local rest="$addr"
+    while [[ "$rest" == *::* ]]; do
+        dc=$((dc + 1))
+        rest="${rest#*::}"
+    done
+    if (( dc > 1 )); then
+        return 1
+    fi
+
+    local parts
+    IFS=':' read -ra parts <<< "$addr"
+    local p groups=0
+    for p in "${parts[@]}"; do
+        if [[ -z "$p" ]]; then
+            continue
+        fi
+        case "$p" in
+            [0-9A-Fa-f]|\
+            [0-9A-Fa-f][0-9A-Fa-f]|\
+            [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]|\
+            [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f])
+                groups=$((groups + 1))
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+
+    if (( dc == 0 )); then
+        # 无压缩：必须恰好 8 组且均非空
+        if (( ${#parts[@]} != 8 )); then
+            return 1
+        fi
+        for p in "${parts[@]}"; do
+            [[ -n "$p" ]] || return 1
+        done
+    else
+        # 有 ::：非空组至多 7
+        if (( groups > 7 )); then
+            return 1
+        fi
+    fi
+
+    if [[ -n "$prefix" ]] && (( 10#$prefix > 128 )); then
+        return 1
+    fi
+    return 0
+}
+
+# 读取 jail.local [DEFAULT] 段中 ignoreip 的值部分（可能为空）
+fail2ban_read_ignoreip() {
+    local f="${1:-/etc/fail2ban/jail.local}"
+    [[ -f "$f" ]] || { echo ""; return 0; }
+    awk '
+        /^\[DEFAULT\]/ { in_def=1; next }
+        /^\[/ { in_def=0 }
+        in_def && /^[[:space:]]*ignoreip[[:space:]]*=/ {
+            sub(/^[[:space:]]*ignoreip[[:space:]]*=[[:space:]]*/, "")
+            gsub(/[[:space:]]+$/, "")
+            print
+            exit
+        }
+    ' "$f"
+}
+
+# 判断 token 是否已在忽略列表中（精确匹配）
+fail2ban_ignoreip_has() {
+    local needle="$1"
+    local hay="$2"
+    local tok
+    for tok in $hay; do
+        [[ "$tok" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+# 备份 jail.local，成功时把路径 echo 到 stdout（调用方用 $() 捕获；失败勿在此 log，避免污染 stdout）
+fail2ban_backup_jail_local() {
+    local src="/etc/fail2ban/jail.local"
+    local bak="/etc/fail2ban/jail.local.bak.$(date +%s)"
+    cp "$src" "$bak" || return 1
+    echo "$bak"
+}
+
+# 清理多余 .bak，仅保留最新 1 个（本功能前缀）
+fail2ban_cleanup_jail_backups() {
+    local f
+    # shellcheck disable=SC2012
+    ls -1t /etc/fail2ban/jail.local.bak.* 2>/dev/null | tail -n +2 | while IFS= read -r f; do
+        [[ -n "$f" && -f "$f" ]] && rm -f "$f" 2>/dev/null || true
+    done || true
+}
+
+# 用 awk 安全重写 [DEFAULT] 唯一 ignoreip 行：action=add|remove，target=IP
+# 绝不新增第二行 ignoreip
+fail2ban_rewrite_ignoreip() {
+    local action="$1"
+    local target="$2"
+    local src="/etc/fail2ban/jail.local"
+    local tmp
+
+    tmp=$(mktemp 2>/dev/null || echo "/tmp/jail.local.$$")
+    if ! awk -v action="$action" -v target="$target" '
+        BEGIN { in_def=0; done_line=0 }
+        /^\[DEFAULT\]/ {
+            in_def=1
+            print
+            next
+        }
+        /^\[/ {
+            if (in_def && !done_line) {
+                if (action == "add") {
+                    print "ignoreip = 127.0.0.1/8 ::1 " target
+                }
+                done_line=1
+            }
+            in_def=0
+            print
+            next
+        }
+        in_def && /^[[:space:]]*ignoreip[[:space:]]*=/ {
+            line=$0
+            sub(/^[[:space:]]*ignoreip[[:space:]]*=[[:space:]]*/, "", line)
+            gsub(/[[:space:]]+$/, "", line)
+            n=split(line, arr, /[[:space:]]+/)
+            out=""
+            if (action == "add") {
+                out=line
+                if (out != "") out=out " "
+                out=out target
+                print "ignoreip = " out
+            } else {
+                # remove: 重建，跳过 target
+                for (i=1; i<=n; i++) {
+                    if (arr[i] == "" || arr[i] == target) continue
+                    if (out != "") out=out " "
+                    out=out arr[i]
+                }
+                if (out == "") out="127.0.0.1/8 ::1"
+                print "ignoreip = " out
+            }
+            done_line=1
+            next
+        }
+        { print }
+        END {
+            if (in_def && !done_line) {
+                if (action == "add") {
+                    print "ignoreip = 127.0.0.1/8 ::1 " target
+                }
+            }
+        }
+    ' "$src" > "$tmp"; then
+        rm -f "$tmp" 2>/dev/null || true
+        log_error "重写 jail.local ignoreip 失败"
+        return 1
+    fi
+
+    if ! mv -f "$tmp" "$src"; then
+        rm -f "$tmp" 2>/dev/null || true
+        log_error "原子替换 jail.local 失败"
+        return 1
+    fi
+    return 0
+}
+
+fail2ban_whitelist_view() {
+    log_section "Fail2ban 白名单 (ignoreip)"
+    if [[ ! -f /etc/fail2ban/jail.local ]]; then
+        log_warn "未找到 /etc/fail2ban/jail.local，请先用安全菜单第 1 项启用 Fail2ban"
+        return 0
+    fi
+
+    local conf_val
+    conf_val=$(fail2ban_read_ignoreip)
+    echo -e "${CYAN}--- 配置文件 jail.local [DEFAULT] ignoreip ---${NC}"
+    if [[ -z "$conf_val" ]]; then
+        echo "  (无 ignoreip 行)"
+    else
+        local tok i=0
+        for tok in $conf_val; do
+            i=$((i + 1))
+            echo "  $i) $tok"
+        done
+        echo -e "${CYAN}当前条目数: ${i}${NC}"
+    fi
+
+    echo ""
+    echo -e "${CYAN}--- 运行期 fail2ban-client get sshd ignoreip ---${NC}"
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        fail2ban-client get sshd ignoreip 2>/dev/null || log_warn "无法获取运行期 ignoreip（服务未运行或 jail 未加载）"
+    else
+        log_warn "未检测到 fail2ban-client"
+    fi
+}
+
+fail2ban_whitelist_add() {
+    log_section "Fail2ban 加白名单 (ignoreip)"
+    local ip="${1:-}"
+
+    if ! command -v fail2ban-client >/dev/null 2>&1 || [[ ! -f /etc/fail2ban/jail.local ]]; then
+        log_warn "请先用安全菜单第 1 项启用 Fail2ban"
+        return 1
+    fi
+
+    if [[ -z "$ip" ]]; then
+        read -p "请输入要加入白名单的 IP/CIDR: " ip
+    fi
+    ip=$(echo "$ip" | awk '{print $1}')
+    if ! fail2ban_validate_ip "$ip"; then
+        log_error "非法 IP/CIDR: ${ip:-<空>}（仅接受 IPv4/IPv6，可带 /前缀）"
+        return 1
+    fi
+
+    local current
+    current=$(fail2ban_read_ignoreip)
+    if fail2ban_ignoreip_has "$ip" "$current"; then
+        log_info "IP 已在白名单中，无需重复添加: $ip"
+        return 0
+    fi
+
+    local bak
+    if ! bak=$(fail2ban_backup_jail_local); then
+        log_error "备份 jail.local 失败"
+        return 1
+    fi
+    log_info "已备份: $bak"
+
+    if ! fail2ban_rewrite_ignoreip add "$ip"; then
+        log_error "写入 ignoreip 失败，原配置未改动（备份: $bak）"
+        return 1
+    fi
+
+    # 配置校验：失败则回滚，绝不让坏配置进服务
+    if ! fail2ban-client -t >/dev/null 2>&1; then
+        if cp "$bak" /etc/fail2ban/jail.local 2>/dev/null; then
+            log_error "配置校验失败已回滚，服务未受影响（fail2ban-client -t 未通过）"
+        else
+            log_error "配置校验失败且回滚复制失败，请手动恢复: $bak"
+        fi
+        return 1
+    fi
+
+    # 运行期生效：优先 live set，避开 RestartPreventExitStatus=255 焊死陷阱
+    if service_is_active_any fail2ban; then
+        fail2ban-client set sshd addignoreip "$ip" >/dev/null 2>&1 || \
+            service_action_any reload fail2ban || service_action_any restart fail2ban || true
+    else
+        service_action_any reload fail2ban || service_action_any restart fail2ban || true
+    fi
+
+    local new_val ok=1
+    new_val=$(fail2ban_read_ignoreip)
+    if ! fail2ban_ignoreip_has "$ip" "$new_val"; then
+        ok=0
+    fi
+    if ! service_is_active_any fail2ban; then
+        ok=0
+    fi
+
+    if (( ok == 1 )); then
+        log_success "已加入白名单: $ip"
+        log_info "当前白名单: $new_val"
+        fail2ban_cleanup_jail_backups
+        return 0
+    fi
+
+    log_error "落地验证失败，请检查: fail2ban-client -t 与 service 状态"
+    log_info "备份仍在: $bak"
+    return 1
+}
+
+fail2ban_whitelist_remove() {
+    log_section "Fail2ban 移除白名单 (ignoreip)"
+    local ip="${1:-}"
+
+    if ! command -v fail2ban-client >/dev/null 2>&1 || [[ ! -f /etc/fail2ban/jail.local ]]; then
+        log_warn "请先用安全菜单第 1 项启用 Fail2ban"
+        return 1
+    fi
+
+    local current
+    current=$(fail2ban_read_ignoreip)
+    if [[ -z "$current" ]]; then
+        log_warn "当前无 ignoreip 条目"
+        return 0
+    fi
+
+    echo -e "${CYAN}当前白名单:${NC}"
+    local tok i=0
+    for tok in $current; do
+        i=$((i + 1))
+        echo "  $i) $tok"
+    done
+
+    if [[ -z "$ip" ]]; then
+        read -p "请输入要移除的 IP/CIDR（或序号）: " ip
+    fi
+    ip=$(echo "$ip" | awk '{print $1}')
+
+    # 支持按序号选择
+    if [[ "$ip" =~ ^[0-9]+$ ]]; then
+        local idx=0 pick=""
+        for tok in $current; do
+            idx=$((idx + 1))
+            if (( idx == 10#$ip )); then
+                pick="$tok"
+                break
+            fi
+        done
+        if [[ -z "$pick" ]]; then
+            log_error "无效序号: $ip"
+            return 1
+        fi
+        ip="$pick"
+    fi
+
+    if ! fail2ban_validate_ip "$ip"; then
+        log_error "非法 IP/CIDR: ${ip:-<空>}"
+        return 1
+    fi
+
+    # 内置回环禁止删除
+    if [[ "$ip" == "127.0.0.1/8" || "$ip" == "::1" || "$ip" == "127.0.0.1" ]]; then
+        log_warn "禁止移除内置回环地址 ($ip)，否则本机可能被自己封禁"
+        return 1
+    fi
+
+    if ! fail2ban_ignoreip_has "$ip" "$current"; then
+        log_info "白名单中不存在: $ip"
+        return 0
+    fi
+
+    local bak
+    if ! bak=$(fail2ban_backup_jail_local); then
+        log_error "备份 jail.local 失败"
+        return 1
+    fi
+    log_info "已备份: $bak"
+
+    if ! fail2ban_rewrite_ignoreip remove "$ip"; then
+        log_error "写入 ignoreip 失败，原配置未改动（备份: $bak）"
+        return 1
+    fi
+
+    if ! fail2ban-client -t >/dev/null 2>&1; then
+        if cp "$bak" /etc/fail2ban/jail.local 2>/dev/null; then
+            log_error "配置校验失败已回滚，服务未受影响（fail2ban-client -t 未通过）"
+        else
+            log_error "配置校验失败且回滚复制失败，请手动恢复: $bak"
+        fi
+        return 1
+    fi
+
+    if service_is_active_any fail2ban; then
+        fail2ban-client set sshd delignoreip "$ip" >/dev/null 2>&1 || \
+            service_action_any reload fail2ban || service_action_any restart fail2ban || true
+    else
+        service_action_any reload fail2ban || service_action_any restart fail2ban || true
+    fi
+
+    local new_val ok=1
+    new_val=$(fail2ban_read_ignoreip)
+    if fail2ban_ignoreip_has "$ip" "$new_val"; then
+        ok=0
+    fi
+
+    if (( ok == 1 )); then
+        log_success "已移除白名单: $ip"
+        log_info "当前白名单: $new_val"
+        fail2ban_cleanup_jail_backups
+        return 0
+    fi
+
+    log_error "落地验证失败，请检查: fail2ban-client -t 与 service 状态"
+    log_info "备份仍在: $bak"
+    return 1
+}
+
+fail2ban_whitelist_menu() {
+    while true; do
+        clear
+        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════╗${NC}"
+        printf "%b\n" "${CYAN}║       Fail2ban 白名单 (ignoreip)             ║${NC}"
+        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${GREEN}  1) 查看白名单${NC}"
+        echo -e "  2) 加白名单"
+        echo -e "  3) 移除白名单"
+        echo -e "  0) 返回"
+        echo ""
+        read -p "请输入选择 [0-3]: " wl_choice
+        case "$wl_choice" in
+            1) fail2ban_whitelist_view; pause_return_main_menu ;;
+            2) fail2ban_whitelist_add; pause_return_main_menu ;;
+            3) fail2ban_whitelist_remove; pause_return_main_menu ;;
+            0) return 0 ;;
+            *) log_error "无效选择"; sleep 1 ;;
+        esac
+    done
 }
 
 # ============ Swap 管理 ============
@@ -1599,6 +2095,57 @@ install_docker_compose_manual_fallback() {
     chmod +x "$plugin_path"
 }
 
+# 裸机可能根本没有 docker 本体；Compose 是 docker 的子命令/插件，没有 docker 无从谈起。
+# 现代 docker 官方一键脚本(get.docker.com)自带 compose 插件，一步到位。
+ensure_docker_installed() {
+    if command -v docker >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log_warn "未检测到 Docker 本体，Compose 依赖 Docker，先安装 Docker"
+
+    case $PKG_MANAGER in
+        apk)
+            # get.docker.com 不支持 Alpine，走官方仓库包（docker-cli-compose 即 compose 插件）
+            apk add --quiet --no-cache docker docker-cli docker-cli-compose >/dev/null 2>&1 || \
+            apk add --quiet --no-cache docker docker-compose >/dev/null 2>&1 || true
+            ;;
+        apt|dnf|yum)
+            local get_docker="/tmp/get-docker.sh"
+            log_warn "即将执行 Docker 官方安装脚本: https://get.docker.com"
+            if download_file "https://get.docker.com" "$get_docker"; then
+                sh "$get_docker" >/dev/null 2>&1 || sh "$get_docker" || true
+                rm -f "$get_docker"
+            else
+                log_warn "下载 Docker 官方脚本失败，尝试包管理器直装"
+                case $PKG_MANAGER in
+                    apt)  apt-get install -y -qq docker.io >/dev/null 2>&1 || true ;;
+                    dnf|yum)
+                        $PKG_MANAGER install -y -q docker >/dev/null 2>&1 || \
+                        $PKG_MANAGER install -y -q docker-ce >/dev/null 2>&1 || true
+                        ;;
+                esac
+            fi
+            ;;
+        *)
+            log_error "未识别的包管理器 ($PKG_MANAGER)，无法自动安装 Docker，请先手动安装 Docker 再重试"
+            return 1
+            ;;
+    esac
+
+    # 装完把 docker 守护进程拉起来（compose 运行需要 daemon）
+    service_enable_any docker >/dev/null 2>&1 || true
+    service_action_any start docker >/dev/null 2>&1 || true
+
+    if command -v docker >/dev/null 2>&1; then
+        log_success "Docker 已安装 ($(docker --version 2>/dev/null || echo ok))"
+        return 0
+    fi
+
+    log_error "Docker 自动安装失败，请手动安装后重试（参考 https://get.docker.com）"
+    return 1
+}
+
 install_docker_compose_tool() {
     log_section "快速补全缺失工具: Docker Compose"
     detect_os
@@ -1607,6 +2154,15 @@ install_docker_compose_tool() {
     if has_docker_compose_plugin || has_docker_compose_legacy; then
         log_success "$(get_docker_compose_status_text)"
         return 0
+    fi
+
+    # 裸机无 docker：先装 docker 本体（官方脚本通常已带 compose 插件，装完直接复检）
+    if ! command -v docker >/dev/null 2>&1; then
+        ensure_docker_installed || return 1
+        if has_docker_compose_plugin || has_docker_compose_legacy; then
+            log_success "$(get_docker_compose_status_text)"
+            return 0
+        fi
     fi
 
     update_pkg_cache
@@ -5659,6 +6215,9 @@ show_help() {
     echo "║    ssh-off    - 禁用 SSH 密码登录 (仅密钥)                   ║"
     echo "║    fail2ban   - 配置/启用 Fail2ban                           ║"
     echo "║    fail2ban-rm - 停用/移除 Fail2ban                          ║"
+    echo "║    fail2ban-whitelist-add [IP] - 安全加入 ignoreip 白名单    ║"
+    echo "║    fail2ban-whitelist-remove [IP] - 安全移除白名单条目       ║"
+    echo "║    fail2ban-whitelist-list - 查看配置与运行期 ignoreip       ║"
     echo "║                                                              ║"
     echo "║  扩展:                                                       ║"
     echo "║    extensions - 打开 bpftune / Brutal / brutal-nginx 管理    ║"
@@ -5855,6 +6414,7 @@ show_security_menu() {
         echo -e "${GREEN}  1) 启用 Fail2ban        (SSH 暴力破解防护)${NC}"
         echo -e "  2) 移除 Fail2ban"
         echo -e "  3) 查看封禁 IP / 状态"
+        echo -e "  9) Fail2ban 白名单      (加白/移除/查看，安全写入防挂服务)"
         echo -e "${YELLOW}  ── SSH / 端口 ──${NC}"
         echo -e "  4) 开启 SSH root 密码登录"
         echo -e "  5) 禁用 SSH 密码登录    (仅密钥)"
@@ -5863,7 +6423,7 @@ show_security_menu() {
         echo -e "  8) 安全摘要检查         (SSH/端口/cron/authorized_keys)"
         echo -e "  0) 返回主菜单"
         echo ""
-        read -p "请输入选择 [0-8]: " sec_choice
+        read -p "请输入选择 [0-9]: " sec_choice
         case "$sec_choice" in
             1) install_fail2ban_basic; pause_return_main_menu ;;
             2) remove_fail2ban_basic; pause_return_main_menu ;;
@@ -5873,6 +6433,7 @@ show_security_menu() {
             6) check_common_ports; pause_return_main_menu ;;
             7) list_all_listening_ports; pause_return_main_menu ;;
             8) security_quick_check; pause_return_main_menu ;;
+            9) fail2ban_whitelist_menu ;;
             0) return 0 ;;
             *) log_error "无效选择"; sleep 1 ;;
         esac
@@ -6095,6 +6656,18 @@ main() {
 
         fail2ban-rm|fail2ban-remove)
             remove_fail2ban_basic
+            ;;
+
+        fail2ban-whitelist-add)
+            fail2ban_whitelist_add "${2:-}"
+            ;;
+
+        fail2ban-whitelist-remove)
+            fail2ban_whitelist_remove "${2:-}"
+            ;;
+
+        fail2ban-whitelist-list)
+            fail2ban_whitelist_view
             ;;
 
         extensions|extension|ext)
