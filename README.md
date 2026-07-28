@@ -6,34 +6,62 @@ AegisTune 是一个面向 Linux 服务器的交互式网络优化脚本，主文
 
 ## Quick Start
 
-```bash
-git clone https://github.com/zhizhishu/AegisTune.git
-cd AegisTune
-chmod +x aegistune.sh
-sudo ./aegistune.sh
-```
+### 一键安装（推荐，**无需 git**）
 
-如果只想先看状态：
+全新服务器经常没装 `git`，直接 `git clone` 会报 `git: command not found`。用下面这条即可，只要机器有 `curl` 或 `wget`（几乎都自带）：
 
 ```bash
-sudo ./aegistune.sh status
+bash <(curl -fsSL https://raw.githubusercontent.com/zhizhishu/AegisTune/main/aegistune.sh) setup
 ```
 
-### 短命令 `aeg`
+它会自动完成三件事：
 
-想要以后随手唤起菜单，可以先安装短命令：
+- 把脚本落地到品牌家目录 **`/root/AegisTune/aegistune.sh`**（无需 `git clone`，也无需手动建文件夹）
+- 安装短命令 `aeg`，之后任意目录输入 `aeg` 即可唤起主菜单（类似 nodeseek 里的 `n`）
+- 在交互终端里直接进入主菜单
 
-```bash
-sudo ./aegistune.sh link
-```
+> 非 root 用户在前面加 `sudo`：`sudo bash <(curl -fsSL https://raw.githubusercontent.com/zhizhishu/AegisTune/main/aegistune.sh) setup`
+> 只有 `wget` 没有 `curl`：`bash <(wget -qO- https://raw.githubusercontent.com/zhizhishu/AegisTune/main/aegistune.sh) setup`
 
-它会把当前脚本软链到 `/usr/local/bin/aeg`。之后在任意目录直接输入：
+装好之后，随手唤起菜单：
 
 ```bash
 aeg
 ```
 
-即可唤起 AegisTune 主菜单（类似 nodeseek 里的 `n` 命令）。
+只想先看状态：
+
+```bash
+aeg status
+```
+
+### 手动下载（不用 git，也不用管道）
+
+如果不想用 `bash <(...)` 管道形式，可以先把脚本下到本地再跑：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhizhishu/AegisTune/main/aegistune.sh -o aegistune.sh
+chmod +x aegistune.sh
+sudo ./aegistune.sh setup     # 落地到 /root/AegisTune + 安装 aeg 短命令
+```
+
+或者不装短命令，直接跑一次：
+
+```bash
+sudo ./aegistune.sh          # 主菜单
+sudo ./aegistune.sh status   # 只看状态
+```
+
+### 开发者：git 克隆
+
+需要二次开发或查看提交历史时再用 git（需先自行安装 git，如 `apt install -y git`）：
+
+```bash
+git clone https://github.com/zhizhishu/AegisTune.git
+cd AegisTune
+chmod +x aegistune.sh
+sudo ./aegistune.sh setup
+```
 
 ## 主菜单结构
 

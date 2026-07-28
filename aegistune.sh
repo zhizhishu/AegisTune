@@ -180,6 +180,9 @@ CAKE_AVAILABLE=0
 FQ_AVAILABLE=0
 AEGIS_HOME="/root/AegisTune"
 SNAPSHOT_ROOT="${AEGIS_HOME}/backups"
+# 一键安装(setup)用：远端原始脚本地址 + 持久化后的本地路径
+AEGIS_RAW_URL="https://raw.githubusercontent.com/zhizhishu/AegisTune/main/aegistune.sh"
+PERSISTED_SELF_PATH=""
 PROVIDER_BASELINE_FILE="${SNAPSHOT_ROOT}/provider-baseline.sysctl"
 PROVIDER_BASELINE_META="${SNAPSHOT_ROOT}/provider-baseline.meta"
 PROVIDER_BASELINE_SOURCEMAP="${SNAPSHOT_ROOT}/provider-baseline-sources.map"
@@ -6175,6 +6178,10 @@ show_help() {
     echo "║  用法: sudo bash $0 [命令]                                   ║"
     echo "║  注: help / self-test / dry-run 可非 root 运行               ║"
     echo "║                                                              ║"
+    echo "║  一键安装 / 快捷:                                            ║"
+    echo "║    setup     - 一键安装(无需 git): 落地 /root/AegisTune      ║"
+    echo "║    link      - 创建 aeg 短命令 (软链 /usr/local/bin/aeg)     ║"
+    echo "║                                                              ║"
     echo "║  网络优化命令:                                               ║"
     echo "║    install   - 交互式安装 (FQ/CAKE，不安装 bpftune)          ║"
     echo "║    uninstall - 卸载网络优化配置                              ║"
@@ -6815,6 +6822,10 @@ main() {
             disable_ssh_password_login
             ;;
 
+        setup|bootstrap|self-install|install-self)
+            run_bootstrap_setup
+            ;;
+
         link|install-cmd|aeg-install)
             install_launcher_cmd
             ;;
@@ -6831,14 +6842,80 @@ main() {
     esac
 }
 
-# 创建 aeg 短命令：软链当前脚本到 /usr/local/bin/aeg，之后输入 aeg 即可唤起菜单
+# 把当前脚本持久化到品牌家目录 $AEGIS_HOME/aegistune.sh。
+# 两种来源：① $0 是本地真实文件 → 复制；② 管道运行(bash <(curl...)/curl|bash) 无实体文件 → 从 RAW_URL 下载。
+# 结果写入全局 PERSISTED_SELF_PATH（不用 stdout 捕获，避免 log_* 输出污染）。
+persist_self_to_home() {
+    local dest="${AEGIS_HOME}/aegistune.sh"
+    local self
+    self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+    mkdir -p "$AEGIS_HOME" 2>/dev/null || true
+
+    if [[ -f "$self" && -r "$self" ]]; then
+        # 已在目标位置就不自我覆盖
+        if [[ "$self" != "$dest" ]]; then
+            if ! cp -f "$self" "$dest"; then
+                log_error "复制脚本到 $dest 失败"
+                return 1
+            fi
+        fi
+    else
+        # 管道/进程替换运行，本地无实体文件 → 从远端拉取
+        log_info "未检测到本地脚本文件（管道运行），正在从远端拉取到 $dest ..."
+        if ! download_file "$AEGIS_RAW_URL" "$dest"; then
+            log_error "下载脚本失败：$AEGIS_RAW_URL（需要 curl 或 wget，且网络可达）"
+            return 1
+        fi
+    fi
+
+    chmod +x "$dest" 2>/dev/null || true
+    PERSISTED_SELF_PATH="$dest"
+    return 0
+}
+
+# 一键安装 setup：无需 git，把脚本落地到 /root/AegisTune 并装好 aeg 短命令。
+run_bootstrap_setup() {
+    log_section "AegisTune 一键安装"
+    if ! persist_self_to_home; then
+        log_error "安装失败：无法把脚本落地到 ${AEGIS_HOME}"
+        return 1
+    fi
+    log_success "脚本已安装到：${PERSISTED_SELF_PATH}"
+
+    if ln -sf "$PERSISTED_SELF_PATH" /usr/local/bin/aeg 2>/dev/null; then
+        log_success "短命令已就绪：以后任意目录输入 'aeg' 即可唤起菜单"
+    else
+        log_warn "短命令 aeg 创建失败（/usr/local/bin 不可写？）稍后可手动运行：${PERSISTED_SELF_PATH} link"
+    fi
+
+    echo ""
+    log_info "安装完成，下一步任选其一："
+    echo -e "  ${GREEN}aeg${NC}                          # 唤起交互式主菜单"
+    echo -e "  ${GREEN}${PERSISTED_SELF_PATH} status${NC}   # 只看当前状态"
+    echo ""
+
+    # 交互终端里直接进主菜单；非交互(如 curl|bash)只给提示不自动进
+    if [ -t 0 ]; then
+        log_info "即将进入主菜单（Ctrl+C 可退出）..."
+        exec "$PERSISTED_SELF_PATH"
+    fi
+    return 0
+}
+
+# 创建 aeg 短命令：软链脚本到 /usr/local/bin/aeg，之后输入 aeg 即可唤起菜单
 install_launcher_cmd() {
     local target="/usr/local/bin/aeg"
     local self
     self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-    if [[ ! -f "$self" ]]; then
-        log_error "无法定位脚本自身路径，短命令创建失败"
-        return 1
+    if [[ ! -f "$self" || ! -r "$self" ]]; then
+        # 管道运行等无实体文件场景：先把脚本落地到品牌家目录再软链
+        if persist_self_to_home; then
+            self="$PERSISTED_SELF_PATH"
+        else
+            log_error "无法定位脚本自身路径，短命令创建失败"
+            return 1
+        fi
     fi
     chmod +x "$self" 2>/dev/null || true
     if ln -sf "$self" "$target" 2>/dev/null; then
