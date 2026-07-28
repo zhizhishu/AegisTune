@@ -116,6 +116,7 @@ SSH / 端口：
 
 - 工具补全（Docker Compose / FRPS）
 - 出站流量守护（到量自动关机）
+- 系统重装（DD / 容器 · **高危擦盘**，见下）
 
 ## Supported Systems
 
@@ -289,8 +290,35 @@ sudo ./aegistune.sh traffic-guard-remove
 
 达到阈值后，守护进程会按顺序尝试 `shutdown -h now`、`poweroff`、`halt -p`。这是一个真实关机动作，请只在确认阈值和网卡无误后启用。
 
+## 系统重装 (DD / 容器)
+
+> ⚠️ **高危：会彻底擦除本服务器全部数据并重装系统，不可逆，本地快照救不了。操作前务必把数据备份到机器之外。**
+
+「系统维护 → 系统重装」是对两个**第三方官方一键脚本的跳转封装**（和 FRPS 一样，脚本运行时下载官方脚本执行，**不移植其逻辑**）。菜单会先检测本机虚拟化类型并给出推荐，帮你在互斥的两条路里选对：
+
+| 路径 | 适用架构 | 官方脚本 | 不适用 |
+|------|---------|---------|--------|
+| **DD 网络重装** | KVM / Xen / 独立服务器 | [leitbogioro `InstallNET.sh`](https://github.com/leitbogioro/Tools) | OpenVZ / LXC 容器 |
+| **容器重装** | OpenVZ 7 / LXC 容器 | [LloydAsp `OsMutation.sh`](https://github.com/LloydAsp/OsMutation) | KVM、OpenVZ 6 |
+
+**装错工具跑不动**，所以菜单在检测到类型不匹配时会红字拦截。三种用法：
+
+- **DD 网络重装**（KVM/Xen/独服）：交互选发行版 / 版本 / root 密码 / SSH 端口 → 显示将执行的完整命令 → **需完整输入大写 `REINSTALL` 二次确认**才会下载并执行（随后机器重启进入安装）。
+- **容器重装**（OpenVZ7/LXC）：同样二次确认后，下载并启动 OsMutation 自带的交互菜单。
+- **只打印命令 / 复制**：只把官方命令按你的选择拼好打印出来，**脚本绝不替你执行**，你自己复制到目标机跑。
+
+CLI：
+
+```bash
+sudo aegistune.sh reinstall        # 系统重装菜单
+sudo aegistune.sh dd               # 直接进 DD 网络重装 (确认后执行)
+sudo aegistune.sh dd-container     # 直接进 容器重装 (确认后执行)
+sudo aegistune.sh reinstall-cmd    # 只打印两条官方命令，不执行
+```
+
 ## Safety Notes
 
+- 系统重装（DD / 容器）会**擦除整机数据并重装系统**，不可逆；仅在交互二次输入 `REINSTALL` 后才执行，且请先把数据备份到机器之外
 - 出站流量守护达到阈值后会**真实关机**；启用前请确认监控网卡和流量上限
 - FRPS 使用第三方一键脚本，建议先确认其行为再在线上机器执行
 - `TCP Brutal` 不应被设为全局默认拥塞控制，脚本里已有保护逻辑
@@ -357,6 +385,12 @@ sudo ./aegistune.sh traffic-guard
 sudo ./aegistune.sh traffic-guard-status
 sudo ./aegistune.sh traffic-guard-stop
 sudo ./aegistune.sh traffic-guard-remove
+
+# 系统重装 (DD / 容器 · 高危擦盘，确认后不可逆)
+sudo ./aegistune.sh reinstall        # 重装菜单
+sudo ./aegistune.sh dd               # DD 网络重装 (KVM/Xen/独服)
+sudo ./aegistune.sh dd-container     # 容器重装 (OpenVZ7/LXC)
+sudo ./aegistune.sh reinstall-cmd    # 只打印官方命令，不执行
 
 # 自检（不需 root，不写系统）
 ./aegistune.sh self-test

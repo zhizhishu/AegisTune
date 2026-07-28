@@ -183,6 +183,9 @@ SNAPSHOT_ROOT="${AEGIS_HOME}/backups"
 # 一键安装(setup)用：远端原始脚本地址 + 持久化后的本地路径
 AEGIS_RAW_URL="https://raw.githubusercontent.com/zhizhishu/AegisTune/main/aegistune.sh"
 PERSISTED_SELF_PATH=""
+# 系统重装(DD/容器)跳转用：第三方官方脚本地址(不移植逻辑，仅下载执行)
+INSTALLNET_URL="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
+OSMUTATION_URL="https://raw.githubusercontent.com/LloydAsp/OsMutation/main/OsMutation.sh"
 PROVIDER_BASELINE_FILE="${SNAPSHOT_ROOT}/provider-baseline.sysctl"
 PROVIDER_BASELINE_META="${SNAPSHOT_ROOT}/provider-baseline.meta"
 PROVIDER_BASELINE_SOURCEMAP="${SNAPSHOT_ROOT}/provider-baseline-sources.map"
@@ -2311,6 +2314,256 @@ show_tools_menu() {
                 log_error "无效选择"
                 sleep 1
                 ;;
+        esac
+    done
+}
+
+# ============ 系统重装 (DD / 容器) — 第三方官方脚本跳转，不移植逻辑 ============
+# DD 网络重装(KVM/Xen/独服): leitbogioro InstallNET.sh —— 不支持 OpenVZ/LXC
+# 容器重装(OpenVZ7/LXC):     LloydAsp OsMutation.sh   —— 不支持 KVM、不支持 OpenVZ6
+# 两者互斥，菜单帮用户按虚拟化类型分流。
+
+VIRT_TYPE="unknown"
+VIRT_IS_CONTAINER=0
+
+detect_virt() {
+    VIRT_TYPE="unknown"; VIRT_IS_CONTAINER=0
+    local v=""
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        v=$(systemd-detect-virt 2>/dev/null || true)
+    fi
+    case "$v" in
+        openvz|lxc|lxc-libvirt|docker|podman|systemd-nspawn|rkt|wsl|proot|pouch|container-other)
+            VIRT_TYPE="$v"; VIRT_IS_CONTAINER=1 ;;
+        kvm|qemu|xen|vmware|microsoft|oracle|parallels|bochs|bhyve|amazon|zvm|uml|apple)
+            VIRT_TYPE="$v"; VIRT_IS_CONTAINER=0 ;;
+        none|"")
+            VIRT_TYPE="none"; VIRT_IS_CONTAINER=0 ;;
+        *container*)
+            VIRT_TYPE="$v"; VIRT_IS_CONTAINER=1 ;;
+        *)
+            VIRT_TYPE="$v"; VIRT_IS_CONTAINER=0 ;;
+    esac
+    # 兜底：systemd-detect-virt 缺失或报 none 时，靠内核暴露面二次判容器
+    if [[ $VIRT_IS_CONTAINER -eq 0 ]]; then
+        if [[ -f /proc/user_beancounters ]]; then
+            VIRT_TYPE="openvz"; VIRT_IS_CONTAINER=1
+        elif grep -qaE '[:/](lxc|docker)' /proc/1/cgroup 2>/dev/null; then
+            VIRT_TYPE="lxc/container"; VIRT_IS_CONTAINER=1
+        fi
+    fi
+}
+
+reinstall_recommend_line() {
+    detect_virt
+    if [[ $VIRT_IS_CONTAINER -eq 1 ]]; then
+        echo -e "  本机虚拟化: ${YELLOW}${VIRT_TYPE}${NC} (容器) → 推荐【容器重装 OsMutation】，InstallNET 不支持容器"
+    elif [[ "$VIRT_TYPE" == "none" ]]; then
+        echo -e "  本机虚拟化: ${YELLOW}物理机/未识别${NC} → 一般走【DD 网络重装】，请自行确认架构"
+    else
+        echo -e "  本机虚拟化: ${GREEN}${VIRT_TYPE}${NC} (非容器) → 推荐【DD 网络重装 InstallNET】"
+    fi
+}
+
+reinstall_danger_banner() {
+    echo ""
+    printf "%b\n" "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+    printf "%b\n" "${RED}║  ⚠ 高危：系统重装会彻底擦除本服务器全部数据并重装系统！     ║${NC}"
+    printf "%b\n" "${RED}║  ⚠ 不可逆、本地快照救不了。务必先把数据备份到机器之外。      ║${NC}"
+    printf "%b\n" "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+reinstall_typed_confirm() {
+    local ans
+    echo -e "${RED}若确认重装，请完整输入大写 REINSTALL 继续（其它任何输入都会取消）：${NC}"
+    read -p "> " ans
+    [[ "$ans" == "REINSTALL" ]]
+}
+
+# 交互收集 InstallNET 参数：结果写全局 DD_ARGS(数组) + DD_CMD_PREVIEW(预览串)
+DD_ARGS=()
+DD_CMD_PREVIEW=""
+dd_collect_params() {
+    DD_ARGS=(); DD_CMD_PREVIEW=""
+    echo ""
+    echo "选择要重装成的系统："
+    echo "  1) Debian 12        2) Debian 11"
+    echo "  3) Ubuntu 22.04     4) Ubuntu 20.04"
+    echo "  5) CentOS 9         6) Rocky Linux 9"
+    echo "  7) AlmaLinux 9      8) Alpine (edge)"
+    echo "  9) 自定义 InstallNET 参数（高级，自己负责）"
+    read -p "请输入选择 [1-9]: " os_c
+    local distro=()
+    case "$os_c" in
+        1) distro=(-debian 12) ;;
+        2) distro=(-debian 11) ;;
+        3) distro=(-ubuntu jammy) ;;
+        4) distro=(-ubuntu focal) ;;
+        5) distro=(-centos 9) ;;
+        6) distro=(-rockylinux 9) ;;
+        7) distro=(-almalinux 9) ;;
+        8) distro=(-alpine) ;;
+        9)
+            local custom
+            read -p "输入完整 InstallNET 参数(如 -debian 12 -pwd xxx -port 22): " custom
+            [[ -z "$custom" ]] && { log_error "参数为空，取消"; return 1; }
+            # shellcheck disable=SC2206
+            DD_ARGS=($custom)
+            DD_CMD_PREVIEW="bash InstallNET.sh $custom"
+            return 0
+            ;;
+        *) log_error "无效选择"; return 1 ;;
+    esac
+
+    local pwd_in port_in
+    read -p "设置重装后 root 密码 (留空用脚本默认 LeitboGi0ro): " pwd_in
+    read -p "设置 SSH 端口 (留空默认 22): " port_in
+
+    DD_ARGS=("${distro[@]}")
+    local preview="bash InstallNET.sh ${distro[*]}"
+    if [[ -n "$pwd_in" ]]; then
+        DD_ARGS+=(-pwd "$pwd_in"); preview+=" -pwd '${pwd_in}'"
+    fi
+    if [[ -n "$port_in" ]]; then
+        DD_ARGS+=(-port "$port_in"); preview+=" -port ${port_in}"
+    fi
+    DD_CMD_PREVIEW="$preview"
+    return 0
+}
+
+# mode = exec | print
+run_dd_reinstall() {
+    local mode="${1:-exec}"
+    log_section "DD 网络重装 (KVM/Xen/独服 · InstallNET.sh)"
+    echo -e "  第三方官方脚本来源: ${CYAN}${INSTALLNET_URL}${NC}"
+    reinstall_recommend_line
+    if [[ $VIRT_IS_CONTAINER -eq 1 ]]; then
+        log_error "检测到本机是容器(${VIRT_TYPE})，InstallNET 官方声明【不支持 OpenVZ/LXC】，装了也跑不动。"
+        if [[ "$mode" != "print" ]]; then
+            local f
+            read -p "仍要强行继续 DD? 容器请改用【容器重装】 [y/N]: " f
+            [[ "$f" =~ ^[Yy]$ ]] || return 0
+        fi
+    fi
+
+    dd_collect_params || return 1
+
+    echo ""
+    echo -e "将执行的命令："
+    echo -e "  ${GREEN}${DD_CMD_PREVIEW}${NC}"
+
+    if [[ "$mode" == "print" ]]; then
+        echo ""
+        echo -e "${YELLOW}[只打印模式] 已按你的选择拼好官方命令，复制到目标机执行即可（脚本不会替你按下执行）。${NC}"
+        echo -e "获取+执行一条龙："
+        echo -e "  ${CYAN}wget --no-check-certificate -qO InstallNET.sh '${INSTALLNET_URL}' && chmod a+x InstallNET.sh && ${DD_CMD_PREVIEW}${NC}"
+        return 0
+    fi
+
+    reinstall_danger_banner
+    reinstall_typed_confirm || { log_info "已取消，未做任何改动。"; return 0; }
+
+    local script="/tmp/InstallNET.sh"
+    log_warn "正在下载官方 InstallNET.sh ..."
+    if ! download_file "$INSTALLNET_URL" "$script"; then
+        log_error "下载失败。可手动执行："
+        echo "  wget --no-check-certificate -qO InstallNET.sh '${INSTALLNET_URL}' && chmod a+x InstallNET.sh && ${DD_CMD_PREVIEW}"
+        return 1
+    fi
+    chmod a+x "$script"
+    log_warn "开始执行重装（机器随后会重启进入安装，请勿断电/关机）..."
+    bash "$script" "${DD_ARGS[@]}"
+}
+
+# mode = exec | print
+run_container_reinstall() {
+    local mode="${1:-exec}"
+    log_section "容器重装 (OpenVZ7/LXC · OsMutation.sh)"
+    echo -e "  第三方官方脚本来源: ${CYAN}${OSMUTATION_URL}${NC}"
+    echo -e "  说明: 支持 OpenVZ7 / LXC 容器互转 Debian/CentOS/Alpine 等；${RED}不支持 KVM、不支持 OpenVZ6${NC}"
+    reinstall_recommend_line
+    if [[ $VIRT_IS_CONTAINER -eq 0 && "$VIRT_TYPE" != "none" ]]; then
+        log_error "检测到本机是 ${VIRT_TYPE}(非容器)，OsMutation 仅适用于容器，KVM 请改用【DD 网络重装】。"
+        if [[ "$mode" != "print" ]]; then
+            local f
+            read -p "仍要强行继续? [y/N]: " f
+            [[ "$f" =~ ^[Yy]$ ]] || return 0
+        fi
+    fi
+
+    local getrun="wget -qO OsMutation.sh ${OSMUTATION_URL} && chmod u+x OsMutation.sh && ./OsMutation.sh"
+    echo ""
+    echo -e "将执行的命令(脚本自带交互菜单)："
+    echo -e "  ${GREEN}${getrun}${NC}"
+
+    if [[ "$mode" == "print" ]]; then
+        echo ""
+        echo -e "${YELLOW}[只打印模式] 复制上面命令到目标容器执行即可（脚本不会替你按下执行）。${NC}"
+        return 0
+    fi
+
+    reinstall_danger_banner
+    reinstall_typed_confirm || { log_info "已取消，未做任何改动。"; return 0; }
+
+    local script="/tmp/OsMutation.sh"
+    log_warn "正在下载官方 OsMutation.sh ..."
+    if ! download_file "$OSMUTATION_URL" "$script"; then
+        log_error "下载失败。可手动执行： ${getrun}"
+        return 1
+    fi
+    chmod u+x "$script"
+    log_warn "启动 OsMutation 交互菜单（后续按其提示操作）..."
+    bash "$script"
+}
+
+reinstall_show_commands() {
+    log_section "系统重装 · 官方命令一览（只看不执行）"
+    reinstall_recommend_line
+    echo ""
+    echo -e "${GREEN}① DD 网络重装 (KVM/Xen/独服) — leitbogioro InstallNET${NC}"
+    echo -e "   ${CYAN}wget --no-check-certificate -qO InstallNET.sh '${INSTALLNET_URL}' && chmod a+x InstallNET.sh && bash InstallNET.sh -debian 12 -pwd '你的密码'${NC}"
+    echo -e "   支持: debian/ubuntu/centos/rockylinux/almalinux/alpine/fedora/kali/windows ；${RED}不支持 OpenVZ/LXC${NC}"
+    echo ""
+    echo -e "${GREEN}② 容器重装 (OpenVZ7/LXC) — LloydAsp OsMutation${NC}"
+    echo -e "   ${CYAN}wget -qO OsMutation.sh ${OSMUTATION_URL} && chmod u+x OsMutation.sh && ./OsMutation.sh${NC}"
+    echo -e "   支持: OpenVZ7 / LXC ；${RED}不支持 KVM、不支持 OpenVZ6${NC}"
+}
+
+show_reinstall_menu() {
+    while true; do
+        clear
+        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════╗${NC}"
+        printf "%b\n" "${CYAN}║        🖥  系统重装 (DD / 容器)               ║${NC}"
+        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════╝${NC}"
+        echo ""
+        reinstall_recommend_line
+        echo ""
+        echo -e "${RED}  ⚠ 会擦除全部数据并重装系统，不可逆！先把数据备份到机器外。${NC}"
+        echo ""
+        echo -e "  1) DD 网络重装        (KVM/Xen/独服 · InstallNET) — 确认后直接执行"
+        echo -e "  2) 容器重装          (OpenVZ7/LXC · OsMutation)  — 确认后直接执行"
+        echo -e "  3) 只打印命令 / 复制  (拼好官方命令，不执行)"
+        echo -e "  0) 返回上级菜单"
+        echo ""
+        local rc pc
+        read -p "请输入选择 [0-3]: " rc
+        case "$rc" in
+            1) run_dd_reinstall exec; pause_return_main_menu; return 0 ;;
+            2) run_container_reinstall exec; pause_return_main_menu; return 0 ;;
+            3)
+                echo "只打印哪个的命令? 1) DD  2) 容器  3) 两个官方命令一览"
+                read -p "请输入选择 [1-3]: " pc
+                case "$pc" in
+                    1) run_dd_reinstall print ;;
+                    2) run_container_reinstall print ;;
+                    3) reinstall_show_commands ;;
+                    *) log_error "无效选择"; sleep 1; continue ;;
+                esac
+                pause_return_main_menu; return 0
+                ;;
+            0) return 0 ;;
+            *) log_error "无效选择"; sleep 1 ;;
         esac
     done
 }
@@ -6216,6 +6469,9 @@ show_help() {
     echo "║    traffic-guard-status - 查看出站流量守护状态               ║"
     echo "║    traffic-guard-stop - 停止出站流量守护服务                 ║"
     echo "║    traffic-guard-remove - 移除出站流量守护服务和配置         ║"
+    echo "║    reinstall  - 系统重装菜单 (DD/容器·高危擦盘不可逆)        ║"
+    echo "║    dd / dd-container - 直接进 DD / 容器重装 (确认后执行)     ║"
+    echo "║    reinstall-cmd - 只打印官方重装命令 (不执行)              ║"
     echo "║                                                              ║"
     echo "║  安全检查命令:                                               ║"
     echo "║    ssh        - 开启 SSH root 密码登录                       ║"
@@ -6456,12 +6712,14 @@ show_maintenance_menu() {
         echo ""
         echo -e "  1) 工具补全             (Docker Compose / FRPS)"
         echo -e "  2) 出站流量守护         (到量自动关机)"
+        echo -e "  3) 系统重装             (DD / 容器 · ${RED}高危擦盘${NC})"
         echo -e "  0) 返回主菜单"
         echo ""
-        read -p "请输入选择 [0-2]: " maint_choice
+        read -p "请输入选择 [0-3]: " maint_choice
         case "$maint_choice" in
             1) show_tools_menu ;;
             2) show_traffic_guard_menu ;;
+            3) show_reinstall_menu ;;
             0) return 0 ;;
             *) log_error "无效选择"; sleep 1 ;;
         esac
@@ -6700,6 +6958,26 @@ main() {
         traffic-guard|egress-guard|net-traffic-guard)
             detect_init_system
             traffic_guard_setup_interactive
+            ;;
+
+        reinstall|sys-reinstall|dd-menu)
+            show_reinstall_menu
+            ;;
+
+        dd|dd-reinstall)
+            run_dd_reinstall exec
+            ;;
+
+        dd-print|dd-cmd)
+            run_dd_reinstall print
+            ;;
+
+        dd-container|container-reinstall|osmutation)
+            run_container_reinstall exec
+            ;;
+
+        reinstall-cmd|dd-list)
+            reinstall_show_commands
             ;;
 
         traffic-guard-menu|traffic-menu)
