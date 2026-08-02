@@ -1361,9 +1361,32 @@ fail2ban_report_failure() {
         tail -n 15 /var/log/fail2ban.log 2>/dev/null | sed 's/^/    /' || true
     fi
     log_info "常见根因与修复："
-    log_info "  1) cloud/精简镜像无 /var/log/auth.log → [sshd] 用 backend = systemd（读 journald）。"
-    log_info "  2) fail2ban.service 设了 RestartPreventExitStatus=255，首启失败不自愈 → 修好配置后手动 restart。"
-    log_info "  3) 手动排查具体报错: fail2ban-client -x start"
+    log_info "  1) systemd 后端报 'No module named systemd' → 缺 python3-systemd（提供 systemd 模块），装上后 restart：apt/dnf install -y python3-systemd。"
+    log_info "  2) cloud/精简镜像无 /var/log/auth.log → 文件后端启动失败，本脚本已优先 systemd 后端（读 journald）。"
+    log_info "  3) fail2ban.service 设了 RestartPreventExitStatus=255，首启失败不自愈 → 修好配置后手动 restart。"
+    log_info "  4) 手动排查具体报错: fail2ban-client -x start"
+}
+
+# systemd 后端依赖 python3-systemd 提供的 `systemd` 模块；Debian/RHEL 只把它列为 Recommends，
+# 精简/cloud 镜像常没装 → fail2ban 报 "No module named 'systemd'"、sshd jail 初始化失败、服务 255 崩。
+# 用 systemd 后端前必须补上并真正验证可 import；不可用则由调用方回退文件后端。
+ensure_python3_systemd() {
+    # 已能导入就不折腾（python3 缺失/导入失败均视为不可用，交调用方回退）
+    if python3 -c 'import systemd.journal' >/dev/null 2>&1; then
+        return 0
+    fi
+    case $PKG_MANAGER in
+        apt)
+            apt-get install -y -qq python3-systemd >/dev/null 2>&1 || true
+            ;;
+        dnf|yum)
+            $PKG_MANAGER install -y python3-systemd >/dev/null 2>&1 || true
+            ;;
+        *)
+            : # 其余(Alpine/OpenRC 等)非 systemd，不该走到这
+            ;;
+    esac
+    python3 -c 'import systemd.journal' >/dev/null 2>&1
 }
 
 install_fail2ban_basic() {
@@ -1404,8 +1427,17 @@ install_fail2ban_basic() {
     # 根本没有 /var/log/auth.log，文件后端会报 "Have not found any log file for sshd jail" 启动失败。
     # 非 systemd（Alpine/OpenRC 等）保持 auto + 文件后端，交给 fail2ban 包内 paths 默认值。
     local f2b_backend="auto"
-    if [[ "$(get_service_manager)" == "systemd" ]]; then
-        f2b_backend="systemd"
+    local host_mgr
+    host_mgr="$(get_service_manager)"
+    if [[ "$host_mgr" == "systemd" ]]; then
+        # systemd 后端读 journald，但依赖 python3-systemd；先补齐并验证可 import，
+        # 否则会像真机那样报 "No module named 'systemd'" 起不来。装不上则回退文件后端。
+        if ensure_python3_systemd; then
+            f2b_backend="systemd"
+        else
+            log_warn "systemd 后端所需 python3-systemd 未能安装/导入，回退文件后端（rsyslog + /var/log/auth.log）"
+            f2b_backend="auto"
+        fi
     fi
 
     cat > /etc/fail2ban/jail.local <<EOF
@@ -1429,6 +1461,11 @@ EOF
     # 只有文件后端才需要 rsyslog 产出 auth.log；systemd 后端直接读 journald，无需 rsyslog。
     if [[ "$f2b_backend" != "systemd" ]]; then
         service_action_any restart rsyslog || true
+        # 回退到文件后端的 systemd 主机：auth.log 可能尚不存在，兜底建空文件，
+        # 否则 fail2ban 文件后端会因 "Have not found any log file for sshd jail" 启动失败。
+        if [[ "$host_mgr" == "systemd" && ! -f /var/log/auth.log ]]; then
+            : > /var/log/auth.log 2>/dev/null || true
+        fi
     fi
     service_enable_any fail2ban || true
     service_action_any restart fail2ban || service_action_any start fail2ban || true
