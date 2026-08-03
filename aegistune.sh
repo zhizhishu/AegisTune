@@ -7,7 +7,11 @@
 # 备注: AegisTune 开发整合
 # =========================================================
 
-set -e
+# 注意：交互式菜单脚本刻意不启用 `set -e`。菜单里大量函数会走 `return 1`
+# 错误分支、或以返回非零的命令收尾（grep 无匹配、探测失败等），若开 set -e
+# 任何一步非零都会把整个脚本踹回 shell、直接退出菜单。本脚本各处已用
+# `|| true` / 显式 return / log_error 自行处理错误，不依赖 set -e。
+set +e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ============ 通用工具 ============ 
@@ -1362,7 +1366,7 @@ fail2ban_report_failure() {
     fi
     log_info "常见根因与修复："
     log_info "  1) systemd 后端报 'No module named systemd' → 缺 python3-systemd（提供 systemd 模块），装上后 restart：apt/dnf install -y python3-systemd。"
-    log_info "  2) cloud/精简镜像无 /var/log/auth.log → 文件后端启动失败，本脚本已优先 systemd 后端（读 journald）。"
+    log_info "  2) 本脚本优先文件后端并确保 rsyslog 产出 /var/log/auth.log；仅纯 journald 无 auth.log 才退 systemd 后端。"
     log_info "  3) fail2ban.service 设了 RestartPreventExitStatus=255，首启失败不自愈 → 修好配置后手动 restart。"
     log_info "  4) 手动排查具体报错: fail2ban-client -x start"
 }
@@ -1426,19 +1430,38 @@ install_fail2ban_basic() {
     # 后端自适应：systemd 主机读 journald——cloud/精简镜像用 systemd-journald 且没装 rsyslog，
     # 根本没有 /var/log/auth.log，文件后端会报 "Have not found any log file for sshd jail" 启动失败。
     # 非 systemd（Alpine/OpenRC 等）保持 auto + 文件后端，交给 fail2ban 包内 paths 默认值。
-    local f2b_backend="auto"
+    # 后端选择（文件后端优先·根治"反复踩 systemd 依赖"坑）：
+    # 文件后端(读 /var/log/auth.log)零 python 依赖、最稳；脚本已装 rsyslog，绝大多数机器都能产出 auth.log。
+    # 只有纯 journald、真没有也产不出 auth.log 的精简云镜像，才退到 systemd 后端(并确保 python3-systemd)。
+    # 教训：旧逻辑对 systemd 主机无脑写 backend=systemd → 缺 python3-systemd 就崩，是本坑反复复发的病根。
+    local f2b_backend
     local host_mgr
     host_mgr="$(get_service_manager)"
-    if [[ "$host_mgr" == "systemd" ]]; then
-        # systemd 后端读 journald，但依赖 python3-systemd；先补齐并验证可 import，
-        # 否则会像真机那样报 "No module named 'systemd'" 起不来。装不上则回退文件后端。
-        if ensure_python3_systemd; then
+    if [[ "$host_mgr" != "systemd" ]]; then
+        # 非 systemd（Alpine/OpenRC 等）：沿用文件后端 + 包内默认 paths（已验证，不动）
+        f2b_backend="auto"
+    else
+        # systemd 主机：先把 rsyslog 拉起来产出 auth.log；有 auth.log/rsyslog 就用零依赖的文件后端
+        service_action_any restart rsyslog >/dev/null 2>&1 || service_action_any start rsyslog >/dev/null 2>&1 || true
+        # 判「文件后端可用」以 auth.log 已在 / rsyslog 真在跑为准；只有 rsyslogd 二进制存在不算——
+        # 装了没跑=文件永远空，fail2ban 能启动却静默零防护(监控一个永不增长的空文件)，比启动失败更坏。
+        if [[ -f /var/log/auth.log ]] || service_is_active_any rsyslog; then
+            f2b_backend="auto"
+            # 仅当 rsyslog 确实活着时才兜底建空 auth.log（它会被喂日志）；否则留空文件会让下次运行误判 + 静默空转。
+            if [[ ! -f /var/log/auth.log ]] && service_is_active_any rsyslog; then
+                : > /var/log/auth.log 2>/dev/null || true
+            fi
+        elif ensure_python3_systemd; then
+            # 纯 journald、无 auth.log/rsyslog：退到 systemd 后端读 journald
             f2b_backend="systemd"
         else
-            log_warn "systemd 后端所需 python3-systemd 未能安装/导入，回退文件后端（rsyslog + /var/log/auth.log）"
+            # 两条路都不通：仍尽力用文件后端 + 建空 auth.log（比无脑 systemd 更不易崩）
             f2b_backend="auto"
+            : > /var/log/auth.log 2>/dev/null || true
+            log_warn "无 rsyslog/auth.log 且 python3-systemd 装不上，已尽力用文件后端；若启动失败请手动检查日志来源"
         fi
     fi
+    log_info "fail2ban 后端选择: $f2b_backend（文件后端零 python 依赖优先，仅纯 journald 才退 systemd）"
 
     cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -6298,164 +6321,404 @@ apply_serverspan_api_profile() {
 
 # ============ SSH 配置 ============
 
-configure_ssh_root_login() {
-    log_section "配置 SSH Root 密码登录"
-    
-    local SSHD_CONFIG="/etc/ssh/sshd_config"
-    local SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
-    local BACKUP_FILE="/etc/ssh/sshd_config.backup.$(date +%Y%m%d%H%M%S)"
-    
-    # 检查 SSH 配置文件
-    if [[ ! -f "$SSHD_CONFIG" ]]; then
-        log_error "SSH 配置文件不存在: $SSHD_CONFIG"
+# ============ SSH 登录方式管理（密码 / 密钥 / 公钥） ============
+#
+# 核心教训：sshd 是"首次匹配生效"，且 Debian/Ubuntu/cloud 镜像的
+# `Include /etc/ssh/sshd_config.d/*.conf` 排在主配置很靠前——所以
+# sshd_config.d/50-cloud-init.conf 的 PasswordAuthentication no 会压过
+# 主配置和 99-*.conf。要真正改登录方式，必须：①写进排最前的 drop-in
+# (00-aegistune.conf) 抢首匹配 + 主配置全局值(前置插入，避开 Match 作用域) ②写完用
+# `sshd -T` 回读确认"真正生效"、校验不过就回滚，而非"写了文件就报成功"。
+#
+# ⚠️ 边界（对抗审计记档，未强解、以护栏+提示兜底）：
+#   - sshd -T 无 -C，读的是全局值；Match User/Address 作用域的覆盖看不到 → 有 Match 时警告用户手动核对。
+#   - AllowUsers/DenyUsers/自定义 `sshd -f 别的配置`/账户策略等语义未逐一判 → 靠"关键动作前先另开会话用密码登录验证"兜底。
+
+# 定位 sshd 可执行文件（有些系统 /usr/sbin 不在 PATH）
+_sshd_bin() {
+    command -v sshd 2>/dev/null && return 0
+    [[ -x /usr/sbin/sshd ]] && { echo /usr/sbin/sshd; return 0; }
+    return 1
+}
+
+# 主配置是否 active 引入 sshd_config.d（决定 drop-in 能否抢首匹配）
+_ssh_include_active() {
+    grep -qiE '^[[:space:]]*Include[[:space:]]+[^#]*sshd_config\.d' /etc/ssh/sshd_config 2>/dev/null
+}
+
+# 配置里是否有 Match 块（我们只改全局值，Match 作用域需人工核对）
+_ssh_has_match_block() {
+    local f
+    for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        grep -qiE '^[[:space:]]*Match[[:space:]]' "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# 把某文件里某指令的【全局】现存行注释掉，并把权威值【前置插入】到文件最前（主配置用）。
+# 前置(而非末尾追加)是为了：①首匹配生效 ②绝不落进末尾的 Match 作用域里。
+# Match 作用域内的同名指令【保留不动】，避免破坏 Match User/Address 的有意例外。
+# busybox awk 安全：大小写不敏感匹配首 token。
+_ssh_comment_and_append() {
+    local file="$1" directive="$2" value="$3" tmp="$1.aegistmp.$$"
+    awk -v d="$directive" -v v="$value" '
+        BEGIN { dl=tolower(d); print d " " v; inmatch=0 }
+        {
+            line=$0; t=line
+            sub(/^[ \t]+/, "", t); sub(/^#+[ \t]*/, "", t)
+            n=split(t, a, /[ \t]+/)
+            if (n>0 && tolower(a[1])=="match") { inmatch=1; print line; next }
+            if (inmatch==0 && n>0 && tolower(a[1])==dl) {
+                if (line ~ /^[ \t]*#/) print line; else print "#" line
+                next
+            }
+            print line
+        }
+    ' "$file" > "$tmp" && cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
+# 我们自己拥有的 drop-in：删旧行 + 追加新行（不留注释残余）
+_ssh_set_dropin() {
+    local file="$1" directive="$2" value="$3" tmp="$1.aegistmp.$$"
+    if [[ ! -f "$file" ]]; then
+        printf '# AegisTune SSH overrides —— 排最前抢 sshd_config.d 首匹配，勿手改\n' > "$file"
+    fi
+    awk -v d="$directive" '
+        BEGIN { dl=tolower(d) }
+        {
+            t=$0; sub(/^[ \t]+/, "", t); sub(/^#+[ \t]*/, "", t)
+            n=split(t, a, /[ \t]+/)
+            if (n>0 && tolower(a[1])==dl) next
+            print
+        }
+    ' "$file" > "$tmp" && cat "$tmp" > "$file"
+    rm -f "$tmp"
+    printf '%s %s\n' "$directive" "$value" >> "$file"
+}
+
+# 读某指令的"真正生效值"（sshd -T 回读，键名全小写）
+_ssh_effective() {
+    local directive_lc; directive_lc="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    local sshd; sshd="$(_sshd_bin)" || return 1
+    "$sshd" -T 2>/dev/null | awk -v k="$directive_lc" '$1==k {print $2; exit}'
+}
+
+# 指令生效值等价判断：PermitRootLogin 的 prohibit-password 与 without-password 同义
+# （不同 OpenSSH 版本 sshd -T 打印名不同，精确比较会误判"未生效"）
+_ssh_value_equiv() {
+    local directive="$1" got="$2" want="$3"
+    [[ "$got" == "$want" ]] && return 0
+    local dl; dl="$(printf '%s' "$directive" | tr 'A-Z' 'a-z')"
+    if [[ "$dl" == "permitrootlogin" ]]; then
+        case "$got|$want" in
+            "prohibit-password|without-password"|"without-password|prohibit-password") return 0 ;;
+        esac
+    fi
+    return 1
+}
+
+# root 无可用密码时开了密码登录也进不来——仅提醒（用于"开密码登录"这类开通路，不阻断）
+_ssh_warn_if_root_has_no_password() {
+    local st
+    st="$(passwd -S root 2>/dev/null | awk '{print $2}')"
+    case "$st" in
+        NP|L)
+            log_warn "检测到 root 账户当前无可用密码（状态: $st）——即便开了密码登录，没设密码也进不去！"
+            log_warn "强烈建议现在就设置 root 密码。"
+            ;;
+    esac
+}
+
+# 关公钥前的终极护栏（fail-closed）：确认 root 有可用密码，否则关了公钥必锁死。
+# 返回 0=确认可用/已设好；1=不可用且未能补救/用户放弃 → 调用方必须中止关公钥。
+_ssh_require_usable_password() {
+    local st
+    st="$(passwd -S root 2>/dev/null | awk '{print $2}')"
+    case "$st" in
+        P)
+            return 0 ;;
+        NP|L)
+            log_warn "root 当前无可用密码（状态: $st）——不设密码就关公钥必锁死。"
+            read -p "现在设置 root 密码? [Y/n]: " sp
+            if [[ "$sp" =~ ^[Nn]$ ]]; then
+                log_error "未设置 root 密码 + 关公钥 = 锁死，已中止。"
+                return 1
+            fi
+            if ! passwd root; then
+                log_error "设置 root 密码失败（passwd 返回非零），为避免锁死已中止。"
+                return 1
+            fi
+            st="$(passwd -S root 2>/dev/null | awk '{print $2}')"
+            if [[ "$st" == "NP" || "$st" == "L" ]]; then
+                log_error "设完密码复检仍显示无可用密码（$st），为避免锁死已中止。"
+                return 1
+            fi
+            return 0 ;;
+        *)
+            # 空/未知（busybox passwd -S 不支持等）——无法确认，fail-closed
+            log_warn "无法确认 root 是否有可用密码（passwd -S 不支持或输出异常，状态: '${st:-空}'）。"
+            log_warn "关公钥后只能用密码登录；若 root 没有可用密码将被锁死。"
+            read -p "你确认 root 有可用密码、并已在另一个会话用密码登录验证过? 输入大写 YES 继续、其它取消: " oc
+            if [[ "$oc" != "YES" ]]; then
+                log_error "未确认 root 密码可用，已中止关闭公钥。"
+                return 1
+            fi
+            return 0 ;;
+    esac
+}
+
+# 应用一组 SSH 指令并"真正生效"：备份 → 权威 drop-in + 主配置全局值 →
+# sshd -t 语法 → 重启 → sshd -T 逐条回读确认（同义值等价）。
+# 入参形如 "PasswordAuthentication=yes"。
+# 返回：0=全生效且重启成功；1=语法错(已回滚)；2=生效校验未过(已回滚)；3=生效已写盘但服务重启失败(未回滚,需手动 restart)。
+ssh_apply_directives_effective() {
+    local main="/etc/ssh/sshd_config"
+    local dropdir="/etc/ssh/sshd_config.d"
+    local dropfile="$dropdir/00-aegistune.conf"
+    local ts backup dropbak="" use_dropin=0 sshd
+    ts="$(date +%Y%m%d%H%M%S)"
+    # 同一秒连调两次（如"先开密码再关公钥"）也不撞备份名：加 PID + 自增序号
+    _SSH_APPLY_SEQ=$(( ${_SSH_APPLY_SEQ:-0} + 1 ))
+
+    [[ -f "$main" ]] || { log_error "SSH 配置不存在: $main"; return 1; }
+    sshd="$(_sshd_bin)" || { log_error "找不到 sshd 可执行文件，拒绝盲改配置"; return 1; }
+
+    backup="${main}.backup.aegistune.${ts}.$$.${_SSH_APPLY_SEQ}"
+    cp "$main" "$backup" || { log_error "备份 $main 失败"; return 1; }
+    log_info "已备份 SSH 主配置 → $backup"
+
+    # 清掉历史遗留的 99-allow-root-password.conf（老逻辑失败产物，排在 50-cloud-init 之后无效）
+    rm -f "$dropdir/99-allow-root-password.conf" 2>/dev/null || true
+
+    if [[ -d "$dropdir" ]] && _ssh_include_active; then
+        use_dropin=1
+        if [[ -f "$dropfile" ]]; then
+            dropbak="${dropfile}.backup.aegistune.${ts}.$$.${_SSH_APPLY_SEQ}"
+            cp "$dropfile" "$dropbak" 2>/dev/null || true
+        fi
+    fi
+
+    local pair d v
+    for pair in "$@"; do
+        d="${pair%%=*}"; v="${pair#*=}"
+        _ssh_comment_and_append "$main" "$d" "$v"
+        [[ $use_dropin -eq 1 ]] && _ssh_set_dropin "$dropfile" "$d" "$v"
+    done
+
+    # 回滚闭包：主配置 + drop-in 都还原到改动前
+    _ssh_rollback() {
+        cp "$backup" "$main" 2>/dev/null || true
+        if [[ $use_dropin -eq 1 ]]; then
+            if [[ -n "$dropbak" ]]; then cp "$dropbak" "$dropfile" 2>/dev/null || true
+            else rm -f "$dropfile" 2>/dev/null || true; fi
+        fi
+    }
+
+    if ! "$sshd" -t 2>/dev/null; then
+        log_error "sshd 配置语法检查未通过，正在回滚..."
+        _ssh_rollback
         return 1
     fi
-    
-    # 备份原配置
-    log_info "备份原始配置到: $BACKUP_FILE"
-    cp "$SSHD_CONFIG" "$BACKUP_FILE"
-    log_success "配置已备份"
-    
-    # 显示当前状态
+
+    local restart_ok=1
+    if ! service_action_any restart sshd ssh; then
+        restart_ok=0
+        log_warn "SSH 服务重启可能失败——磁盘配置已改，但运行中的 sshd 可能仍用旧配置。"
+    fi
+
+    # 生效校验（同义值等价）
+    local all_ok=1 el
+    for pair in "$@"; do
+        d="${pair%%=*}"; v="${pair#*=}"
+        el="$(_ssh_effective "$d")"
+        if _ssh_value_equiv "$d" "$el" "$v"; then
+            log_success "生效确认：$d = ${el:-$v}"
+        else
+            log_error "生效校验未过：$d 期望=$v 实际=${el:-未知}（可能被更前的 drop-in 或 Match 块压制）"
+            all_ok=0
+        fi
+    done
+
+    if [[ $all_ok -ne 1 ]]; then
+        log_warn "生效校验未通过，回滚到改动前配置，避免留下半生效的危险状态..."
+        _ssh_rollback
+        service_action_any restart sshd ssh >/dev/null 2>&1 || true
+        return 2
+    fi
+
+    [[ $restart_ok -eq 1 ]] && return 0 || return 3
+}
+
+configure_ssh_root_login() {
+    log_section "开启 SSH Root 密码登录"
+    local SSHD_CONFIG="/etc/ssh/sshd_config"
+    [[ -f "$SSHD_CONFIG" ]] || { log_error "SSH 配置文件不存在: $SSHD_CONFIG"; return 1; }
+
     echo ""
-    echo -e "${CYAN}当前 SSH 配置状态:${NC}"
-    local current_root_login=$(grep -E "^#?PermitRootLogin" "$SSHD_CONFIG" | tail -1 || echo "未设置")
-    local current_password_auth=$(grep -E "^#?PasswordAuthentication" "$SSHD_CONFIG" | tail -1 || echo "未设置")
-    echo "  PermitRootLogin:        $current_root_login"
-    echo "  PasswordAuthentication: $current_password_auth"
+    echo -e "${CYAN}当前生效状态（sshd -T 回读）:${NC}"
+    echo "  PermitRootLogin:        $(_ssh_effective PermitRootLogin || echo 未知)"
+    echo "  PasswordAuthentication: $(_ssh_effective PasswordAuthentication || echo 未知)"
     echo ""
-    
-    # 确认操作
-    echo -e "${YELLOW}⚠️  警告: 开启 root 密码登录会降低安全性！${NC}"
-    echo -e "${YELLOW}   建议：设置强密码 + 使用 fail2ban 防暴力破解${NC}"
+    echo -e "${YELLOW}⚠️  警告: 开启 root 密码登录会降低安全性！建议配合强密码 + fail2ban。${NC}"
+    _ssh_has_match_block && log_warn "配置含 Match 块：本工具只改全局设置，Match User/Address 作用域请手动核对。"
     echo ""
     read -p "确认要开启 SSH root 密码登录? [y/N]: " confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        log_info "已取消操作"
-        return 0
-    fi
-    
-    # 修改配置
-    log_info "正在修改 SSH 配置..."
-    
-    # 处理 PermitRootLogin
-    if grep -qE "^PermitRootLogin" "$SSHD_CONFIG"; then
-        sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG"
-    elif grep -qE "^#PermitRootLogin" "$SSHD_CONFIG"; then
-        sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG"
+    [[ "$confirm" =~ ^[Yy]$ ]] || { log_info "已取消操作"; return 0; }
+
+    ssh_apply_directives_effective PermitRootLogin=yes PasswordAuthentication=yes
+    local rc=$?
+    if [[ $rc -eq 0 || $rc -eq 3 ]]; then
+        log_success "SSH root 密码登录配置已写入并确认生效"
+        [[ $rc -eq 3 ]] && log_warn "但 SSH 服务重启失败，请手动 systemctl restart sshd（或 service ssh restart）使其生效。"
+        _ssh_warn_if_root_has_no_password
+        echo ""
+        read -p "是否现在设置/修改 root 密码? [y/N]: " set_pw
+        [[ "$set_pw" =~ ^[Yy]$ ]] && passwd root
+    elif [[ $rc -eq 1 ]]; then
+        log_error "配置语法错误已回滚，未改动生效配置"
+        return 1
     else
-        echo "PermitRootLogin yes" >> "$SSHD_CONFIG"
-    fi
-    
-    # 处理 PasswordAuthentication
-    if grep -qE "^PasswordAuthentication" "$SSHD_CONFIG"; then
-        sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
-    elif grep -qE "^#PasswordAuthentication" "$SSHD_CONFIG"; then
-        sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
-    else
-        echo "PasswordAuthentication yes" >> "$SSHD_CONFIG"
-    fi
-    
-    # 处理 sshd_config.d 目录下可能覆盖的配置 (Ubuntu 22.04+)
-    if [[ -d "$SSHD_CONFIG_DIR" ]]; then
-        log_info "检查 $SSHD_CONFIG_DIR 目录..."
-        
-        # 创建覆盖配置
-        cat > "$SSHD_CONFIG_DIR/99-allow-root-password.conf" <<'EOF'
-# 允许 root 密码登录
-PermitRootLogin yes
-PasswordAuthentication yes
-EOF
-        log_success "创建覆盖配置: $SSHD_CONFIG_DIR/99-allow-root-password.conf"
-    fi
-    
-    # 验证配置语法
-    log_info "验证配置语法..."
-    if sshd -t 2>/dev/null; then
-        log_success "配置语法正确"
-    else
-        log_error "配置语法错误！正在恢复备份..."
-        cp "$BACKUP_FILE" "$SSHD_CONFIG"
-        rm -f "$SSHD_CONFIG_DIR/99-allow-root-password.conf" 2>/dev/null
+        log_error "配置未回读到预期值、已回滚（可能有更前的 drop-in/Match 压制），请手动 sshd -T 检查"
         return 1
     fi
-    
-    # 重启 SSH 服务
-    log_info "重启 SSH 服务..."
-    if service_action_any restart sshd ssh; then
-        log_success "SSH 服务已重启"
-    else
-        log_warn "SSH 服务重启可能失败，请手动检查"
-    fi
-    
-    # 询问是否修改 root 密码
-    echo ""
-    read -p "是否现在设置/修改 root 密码? [y/N]: " set_password
-    
-    if [[ "$set_password" =~ ^[Yy]$ ]]; then
-        log_info "请输入新的 root 密码:"
-        passwd root
-    fi
-    
-    # 显示最终结果
-    echo ""
-    echo -e "${GREEN}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║              ✅ SSH Root 密码登录已开启！                    ║"
-    echo "╠══════════════════════════════════════════════════════════════╣"
-    echo "║                                                              ║"
-    echo "║  已修改:                                                     ║"
-    echo "║    • PermitRootLogin yes                                    ║"
-    echo "║    • PasswordAuthentication yes                             ║"
-    echo "║                                                              ║"
-    echo "║  备份文件: $BACKUP_FILE               ║"
-    echo "║                                                              ║"
-    echo "║  ⚠️  安全建议:                                               ║"
-    echo "║    1. 使用强密码 (大小写+数字+特殊字符，12位以上)            ║"
-    echo "║    2. 安装 fail2ban 防暴力破解                               ║"
-    echo "║    3. 考虑修改 SSH 端口 (Port 22 -> 其他)                    ║"
-    echo "║                                                              ║"
-    echo "║  恢复原配置:                                                 ║"
-    echo "║    cp $BACKUP_FILE /etc/ssh/sshd_config ║"
-    echo "║    systemctl restart sshd                                   ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
 }
 
 disable_ssh_password_login() {
     log_section "禁用 SSH 密码登录 (仅密钥)"
-    
     local SSHD_CONFIG="/etc/ssh/sshd_config"
-    local SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
-    
-    # 确认操作
-    echo -e "${YELLOW}⚠️  警告: 禁用密码登录后，只能通过 SSH 密钥访问！${NC}"
-    echo -e "${YELLOW}   请确保你已经配置好 SSH 密钥登录！${NC}"
+    [[ -f "$SSHD_CONFIG" ]] || { log_error "SSH 配置文件不存在: $SSHD_CONFIG"; return 1; }
+
+    echo -e "${YELLOW}⚠️  警告: 禁用密码登录后，只能用 SSH 密钥访问！${NC}"
+    # 护栏：确认公钥登录真的开着，否则禁密码=锁死
+    local pk; pk="$(_ssh_effective PubkeyAuthentication)"
+    if [[ "$pk" != "yes" ]]; then
+        log_error "当前公钥登录未生效（PubkeyAuthentication=${pk:-未知}）——禁用密码会把你锁死在门外，已中止。"
+        log_info "请先确保密钥登录可用（PubkeyAuthentication yes + 已配置 authorized_keys）再来禁用密码。"
+        return 1
+    fi
+    if [[ ! -s /root/.ssh/authorized_keys && ! -s "${HOME}/.ssh/authorized_keys" ]]; then
+        log_warn "未发现非空的 authorized_keys（/root/.ssh/ 或 $HOME/.ssh/）——确认你的密钥确实能登录再继续！"
+    fi
+    _ssh_has_match_block && log_warn "配置含 Match 块：本工具只改全局设置，Match 作用域可能另有登录方式，请手动核对。"
+    echo -e "${YELLOW}强烈建议：先另开一个新终端用密钥登录验证能进，再断开当前会话。${NC}"
     echo ""
     read -p "确认要禁用 SSH 密码登录? [y/N]: " confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        log_info "已取消操作"
-        return 0
-    fi
-    
-    # 备份
-    cp "$SSHD_CONFIG" "$SSHD_CONFIG.backup.$(date +%Y%m%d%H%M%S)"
-    
-    # 修改配置
-    sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' "$SSHD_CONFIG"
-    sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
-    
-    # 删除覆盖配置
-    rm -f "$SSHD_CONFIG_DIR/99-allow-root-password.conf" 2>/dev/null
-    
-    # 重启服务
-    if service_action_any restart sshd ssh; then
-        log_success "SSH 密码登录已禁用，仅允许密钥登录"
+    [[ "$confirm" =~ ^[Yy]$ ]] || { log_info "已取消操作"; return 0; }
+
+    ssh_apply_directives_effective PasswordAuthentication=no PermitRootLogin=prohibit-password
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        log_success "SSH 密码登录已禁用（仅密钥），并确认生效"
+    elif [[ $rc -eq 3 ]]; then
+        log_success "SSH 密码登录配置已写入（仅密钥）"
+        log_warn "但 SSH 服务重启失败，请手动 systemctl restart sshd 使其生效。"
     else
-        log_warn "SSH 重启失败，请手动检查 sshd/ssh 服务状态"
+        log_error "禁用未生效已回滚（rc=$rc），请 sshd -T 手动核对"
+        return 1
     fi
+}
+
+# 新功能：一键关闭公钥登录（改用密码），带"锁死护栏"——多发行版首匹配生效。
+disable_ssh_pubkey_login() {
+    log_section "关闭 SSH 公钥登录 (仅密码)"
+    local SSHD_CONFIG="/etc/ssh/sshd_config"
+    [[ -f "$SSHD_CONFIG" ]] || { log_error "SSH 配置文件不存在: $SSHD_CONFIG"; return 1; }
+
+    echo ""
+    echo -e "${CYAN}当前生效状态（sshd -T 回读）:${NC}"
+    local pa pk prl
+    pa="$(_ssh_effective PasswordAuthentication)"
+    pk="$(_ssh_effective PubkeyAuthentication)"
+    prl="$(_ssh_effective PermitRootLogin)"
+    echo "  PubkeyAuthentication:   ${pk:-未知}"
+    echo "  PasswordAuthentication: ${pa:-未知}"
+    echo "  PermitRootLogin:        ${prl:-未知}"
+    echo ""
+    _ssh_has_match_block && log_warn "配置含 Match 块：sshd -T 读的是全局值，Match User/Address 里对密码/公钥的单独设置本工具看不到、也可能覆盖，请务必手动核对。"
+
+    # 护栏一：关公钥后唯一入口是密码。密码开关必须生效；root 场景 PermitRootLogin 必须 yes（prohibit-password 连密码也挡）。
+    local lockout=0
+    [[ "$pa" != "yes" ]] && lockout=1
+    if [[ "$(id -u)" == "0" ]]; then
+        case "$prl" in yes) ;; *) lockout=1 ;; esac
+    fi
+
+    if [[ $lockout -eq 1 ]]; then
+        echo -e "${RED}⚠️  危险：关闭公钥后只能靠密码登录——但当前密码登录不可用：${NC}"
+        [[ "$pa" != "yes" ]] && echo -e "${RED}    · PasswordAuthentication = ${pa:-未知}（需为 yes）${NC}"
+        if [[ "$(id -u)" == "0" ]]; then
+            case "$prl" in yes) ;; *) echo -e "${RED}    · PermitRootLogin = ${prl:-未知}（root 需为 yes 才能用密码）${NC}" ;; esac
+        fi
+        echo -e "${RED}    现在直接关公钥 = 把自己锁死在门外。${NC}"
+        echo ""
+        echo "  1) 我先帮你开好密码登录（PermitRootLogin yes + PasswordAuthentication yes，回读确认），再关公钥"
+        echo "  2) 取消"
+        echo ""
+        read -p "请选择 [1/2]: " ga
+        case "$ga" in
+            1)
+                log_info "先开启密码登录..."
+                ssh_apply_directives_effective PermitRootLogin=yes PasswordAuthentication=yes
+                if [[ $? -ne 0 ]]; then
+                    log_error "密码登录未能确认生效（或服务未重启），为避免锁死已中止关闭公钥。"
+                    return 1
+                fi
+                ;;
+            *)
+                log_info "已取消，未改动任何配置。"
+                return 0
+                ;;
+        esac
+    fi
+
+    # 护栏二（fail-closed·无论上面 lockout 与否都必过）：确认 root 真有可用密码，否则关公钥必锁死。
+    if ! _ssh_require_usable_password; then
+        return 1
+    fi
+
+    echo ""
+    echo -e "${YELLOW}即将关闭公钥登录（PubkeyAuthentication no）。${RED}强烈建议：先另开一个新终端用密码登录验证能进，再断开当前会话！${NC}"
+    read -p "确认关闭 SSH 公钥登录? [y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { log_info "已取消操作"; return 0; }
+
+    ssh_apply_directives_effective PubkeyAuthentication=no
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        log_success "SSH 公钥登录已关闭，仅允许密码登录（已回读确认生效）"
+        echo -e "${CYAN}如需恢复：把 /etc/ssh/sshd_config.backup.aegistune.* 覆盖回去，或编辑 /etc/ssh/sshd_config.d/00-aegistune.conf 删掉 PubkeyAuthentication no，再 systemctl restart sshd${NC}"
+    elif [[ $rc -eq 3 ]]; then
+        log_success "SSH 公钥登录配置已写入（仅密码）"
+        log_warn "但 SSH 服务重启失败，请手动 systemctl restart sshd 使其生效；生效前请勿断开当前会话。"
+    else
+        log_error "关闭公钥未生效已回滚（rc=$rc），请 sshd -T 手动核对"
+        return 1
+    fi
+}
+
+# SSH 登录方式子菜单（集中三个开关 + 顶部显示当前生效状态，防误锁）
+ssh_login_method_menu() {
+    while true; do
+        clear
+        printf "%b\n" "${CYAN}── SSH 登录方式管理 ──${NC}"
+        echo ""
+        echo -e "${CYAN}当前生效（sshd -T）:${NC} 公钥=$(_ssh_effective PubkeyAuthentication || echo ?)  密码=$(_ssh_effective PasswordAuthentication || echo ?)  Root=$(_ssh_effective PermitRootLogin || echo ?)"
+        echo ""
+        echo -e "${GREEN}  1) 开启 SSH root 密码登录${NC}"
+        echo -e "  2) 禁用 SSH 密码登录    (仅密钥)"
+        echo -e "  3) 关闭 SSH 公钥登录    (仅密码，带锁死护栏)"
+        echo -e "  0) 返回"
+        echo ""
+        read -p "请输入选择 [0-3]: " m
+        case "$m" in
+            1) detect_os && detect_init_system; configure_ssh_root_login; pause_return_main_menu ;;
+            2) detect_os && detect_init_system; disable_ssh_password_login; pause_return_main_menu ;;
+            3) detect_os && detect_init_system; disable_ssh_pubkey_login; pause_return_main_menu ;;
+            0) return 0 ;;
+            *) log_error "无效选择"; sleep 1 ;;
+        esac
+    done
 }
 
 # ============ 帮助 ============
@@ -6513,6 +6776,7 @@ show_help() {
     echo "║  安全检查命令:                                               ║"
     echo "║    ssh        - 开启 SSH root 密码登录                       ║"
     echo "║    ssh-off    - 禁用 SSH 密码登录 (仅密钥)                   ║"
+    echo "║    ssh-pubkey-off - 关闭 SSH 公钥登录 (仅密码·带护栏)        ║"
     echo "║    fail2ban   - 配置/启用 Fail2ban                           ║"
     echo "║    fail2ban-rm - 停用/移除 Fail2ban                          ║"
     echo "║    fail2ban-whitelist-add [IP] - 安全加入 ignoreip 白名单    ║"
@@ -6716,8 +6980,7 @@ show_security_menu() {
         echo -e "  3) 查看封禁 IP / 状态"
         echo -e "  9) Fail2ban 白名单      (加白/移除/查看，安全写入防挂服务)"
         echo -e "${YELLOW}  ── SSH / 端口 ──${NC}"
-        echo -e "  4) 开启 SSH root 密码登录"
-        echo -e "  5) 禁用 SSH 密码登录    (仅密钥)"
+        echo -e "  4) SSH 登录方式管理     (密码/密钥/公钥开关·带锁死护栏)"
         echo -e "  6) 常用端口检查/修复    (22/80/443)"
         echo -e "  7) 查看全部监听端口"
         echo -e "  8) 安全摘要检查         (SSH/端口/cron/authorized_keys)"
@@ -6728,8 +6991,7 @@ show_security_menu() {
             1) install_fail2ban_basic; pause_return_main_menu ;;
             2) remove_fail2ban_basic; pause_return_main_menu ;;
             3) fail2ban_status_view; pause_return_main_menu ;;
-            4) detect_os && detect_init_system; configure_ssh_root_login; pause_return_main_menu ;;
-            5) detect_os && detect_init_system; disable_ssh_password_login; pause_return_main_menu ;;
+            4) ssh_login_method_menu ;;
             6) check_common_ports; pause_return_main_menu ;;
             7) list_all_listening_ports; pause_return_main_menu ;;
             8) security_quick_check; pause_return_main_menu ;;
@@ -7135,6 +7397,11 @@ main() {
         ssh-off|ssh-disable)
             detect_os && detect_init_system
             disable_ssh_password_login
+            ;;
+
+        ssh-pubkey-off|ssh-key-off|pubkey-off)
+            detect_os && detect_init_system
+            disable_ssh_pubkey_login
             ;;
 
         setup|bootstrap|self-install|install-self)
