@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =========================================================
-# AegisTune 网络优化助手（BBR + 扩展模块 + 快照）
+# AegisTune 网络优化助手（BBR + BDP 缓冲 + 快照）
 # 支持: Ubuntu / Debian / Alpine Linux
-# 功能: 环境检测 + BBR + CAKE/FQ 安装 + 扩展模块管理 + 快照回滚 + 安全检查
+# 功能: 环境检测 + BBR + CAKE/FQ 安装(按 BDP 算缓冲) + 快照回滚 + 安全检查
 # 备注: AegisTune 开发整合
 # =========================================================
 
@@ -36,9 +36,8 @@ ensure_brutal_not_default() {
 }
 
 warn_brutal_usage() {
-    if is_tcp_brutal_loaded; then
+    if lsmod | grep -q "^brutal" 2>/dev/null; then
         log_warn "已加载 brutal 模块：请勿将其设为全局拥塞控制，仅在支持的应用中按需启用（如 sing-box/mihomo 的 brutal、brutal-nginx）。"
-        log_info "如遇异常或不再需要，可在主菜单 5 的扩展管理中彻底删除 brutal 模块。"
     fi
 }
 
@@ -190,37 +189,13 @@ PERSISTED_SELF_PATH=""
 # 系统重装(DD/容器)跳转用：第三方官方脚本地址(不移植逻辑，仅下载执行)
 INSTALLNET_URL="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
 OSMUTATION_URL="https://raw.githubusercontent.com/LloydAsp/OsMutation/main/OsMutation.sh"
-PROVIDER_BASELINE_FILE="${SNAPSHOT_ROOT}/provider-baseline.sysctl"
-PROVIDER_BASELINE_META="${SNAPSHOT_ROOT}/provider-baseline.meta"
-PROVIDER_BASELINE_SOURCEMAP="${SNAPSHOT_ROOT}/provider-baseline-sources.map"
 STATUS_CACHE_ROOT="/tmp/aegistune"
 PUBLIC_IPV4_CACHE="${STATUS_CACHE_ROOT}/public_ipv4.cache"
 PUBLIC_IPV6_CACHE="${STATUS_CACHE_ROOT}/public_ipv6.cache"
-SERVERSPAN_API_URL="https://www.serverspan.com/tools/api/sysctl_api.php"
-SERVERSPAN_WEB_URL="https://www.serverspan.com/en/tools/sysctl"
-SERVERSPAN_SYSCTL_FILE="/etc/sysctl.d/99-aegistune-serverspan.conf"
-SMART_BDP_SYSCTL_FILE="/etc/sysctl.d/99-aegistune-smart-bdp.conf"
-AUTO_MERGED_SYSCTL_FILE="/etc/sysctl.d/99-aegistune-auto-merged.conf"
-FORWARDING_OVERLAY_FILE="/etc/sysctl.d/99-aegistune-forwarding.conf"
-PROVIDER_RESTORE_FILE="/etc/sysctl.d/99-aegistune-provider-baseline-restore.conf"
 TRAFFIC_GUARD_SERVICE="aegistune-traffic-guard"
 TRAFFIC_GUARD_CONFIG="/etc/aegistune-traffic-guard.conf"
 TRAFFIC_GUARD_RUNNER="/usr/local/sbin/aegistune-traffic-guard"
 TRAFFIC_GUARD_LOG="/var/log/aegistune-traffic-guard.log"
-SERVERSPAN_LAST_API_HTTP_CODE=""
-SERVERSPAN_LAST_WEB_HTTP_CODE=""
-AUTO_BUFFER_FLOOR_APPLIED=0
-AUTO_BUFFER_FLOOR_SOURCE=""
-AUTO_BUFFER_ORIGINAL_MAX=""
-AUTO_BUFFER_TARGET_MAX=""
-SERVERSPAN_BUILD_SOURCE=""
-SERVERSPAN_BUILD_USED_API=0
-SERVERSPAN_BUILD_USED_WEB=0
-SERVERSPAN_BUILD_USED_LOCAL=0
-SERVERSPAN_BUILD_RAM=0
-SERVERSPAN_BUILD_THREADS=0
-SELFTEST_RTT_SOURCE=""
-SELFTEST_RTT_TARGET=""
 
 # ============ 工具函数 ============
 
@@ -371,31 +346,6 @@ service_daemon_reload() {
     systemctl daemon-reload 2>/dev/null || true
 }
 
-is_bpftune_running() {
-    if service_is_active_any bpftune; then
-        return 0
-    fi
-    if pgrep -x bpftune >/dev/null 2>&1; then
-        return 0
-    fi
-    return 1
-}
-
-is_bpftune_installed() {
-    command -v bpftune >/dev/null 2>&1
-}
-
-is_tcp_brutal_loaded() {
-    lsmod | grep -q "^brutal"
-}
-
-is_tcp_brutal_installed() {
-    find /lib/modules -type f -name "brutal.ko*" 2>/dev/null | grep -q .
-}
-
-is_brutal_nginx_installed() {
-    [[ -f /etc/nginx/modules/ngx_http_tcp_brutal_module.so ]]
-}
 
 pause_return_main_menu() {
     echo ""
@@ -735,42 +685,73 @@ EOF
     log_success "内核模块配置完成"
 }
 
-configure_sysctl() {
-    log_section "配置 BBR + $QDISC_CHOICE"
-    
-    local CONFIG_CONTENT="# ================================================
-# BBR + ${QDISC_CHOICE^^} 网络优化配置
-# 生成时间: $(date)
-# ================================================
+# ===== BDP 缓冲计算：按「区域 RTT × 带宽」算 2×BDP，取代旧的按内存瞎算 =====
+# 区域 RTT 预设（ms）——证据实测：跨太平洋 100~170ms、亚洲区域内更低
+_BDP_RTT_ASIA=50
+_BDP_RTT_TRANSPAC=150
+_BDP_FLOOR=$((8 * 1024 * 1024))     # 缓冲下限 8MB
+_BDP_CEIL=$((64 * 1024 * 1024))     # 缓冲上限 64MB（研究结论：别盲目 >64MB）
 
-# === 拥塞控制 ===
+# 取区域 RTT → BDP_RTT_MS。环境变量 AEGIS_RTT_MS 可覆盖；非交互默认跨太平洋
+_bdp_prompt_region_rtt() {
+    if [[ -n "${AEGIS_RTT_MS:-}" ]]; then BDP_RTT_MS="$AEGIS_RTT_MS"; return 0; fi
+    if [[ ! -t 0 ]]; then BDP_RTT_MS="$_BDP_RTT_TRANSPAC"; return 0; fi
+    echo ""
+    echo "线路区域（决定 RTT，用于按 BDP 算 TCP 缓冲）:"
+    echo "  1) 亚洲近距    (RTT≈${_BDP_RTT_ASIA}ms)"
+    echo "  2) 跨太平洋    (RTT≈${_BDP_RTT_TRANSPAC}ms)"
+    echo "  3) 自定义实测 RTT"
+    read -p "请选择 [1/2/3] (默认 2): " _r
+    case "${_r:-2}" in
+        1) BDP_RTT_MS="$_BDP_RTT_ASIA" ;;
+        2) BDP_RTT_MS="$_BDP_RTT_TRANSPAC" ;;
+        3) read -p "输入实测 RTT(ms): " BDP_RTT_MS ;;
+        *) BDP_RTT_MS="$_BDP_RTT_TRANSPAC" ;;
+    esac
+    [[ "$BDP_RTT_MS" =~ ^[0-9]+$ ]] || BDP_RTT_MS="$_BDP_RTT_TRANSPAC"
+}
+
+# 取带宽 Mbps → BDP_BW_MBPS。环境变量 AEGIS_BW_MBPS 可覆盖；非交互默认 1000
+_bdp_prompt_bandwidth() {
+    if [[ -n "${AEGIS_BW_MBPS:-}" ]]; then BDP_BW_MBPS="$AEGIS_BW_MBPS"; return 0; fi
+    if [[ ! -t 0 ]]; then BDP_BW_MBPS=1000; return 0; fi
+    read -p "端口/线路带宽 (Mbps，默认 1000): " BDP_BW_MBPS
+    BDP_BW_MBPS="${BDP_BW_MBPS:-1000}"
+    [[ "$BDP_BW_MBPS" =~ ^[0-9]+$ ]] || BDP_BW_MBPS=1000
+}
+
+# BDP(bytes)=带宽Mbps×RTTms×125；缓冲=2×BDP，夹 [_BDP_FLOOR, _BDP_CEIL]。回显字节
+_bdp_buffer_bytes() {
+    local bw="$1" rtt="$2" buf
+    buf=$(( bw * rtt * 125 * 2 ))
+    (( buf < _BDP_FLOOR )) && buf=$_BDP_FLOOR
+    (( buf > _BDP_CEIL )) && buf=$_BDP_CEIL
+    echo "$buf"
+}
+
+configure_sysctl() {
+    _bdp_prompt_region_rtt
+    _bdp_prompt_bandwidth
+    local _buf _mid _def _buf_mib
+    _buf=$(_bdp_buffer_bytes "$BDP_BW_MBPS" "$BDP_RTT_MS")
+    _mid=$(( _buf / 4 )); (( _mid < 262144 )) && _mid=262144
+    _def=$(( _buf / 8 )); (( _def < 131072 )) && _def=131072
+    _buf_mib=$(awk -v v="$_buf" 'BEGIN{printf "%.1f", v/1048576}')
+    log_section "配置 BBR + $QDISC_CHOICE  (缓冲=2×BDP: ${BDP_BW_MBPS}Mbps × ${BDP_RTT_MS}ms ≈ ${_buf_mib} MiB)"
+
+    local CONFIG_CONTENT="# ================================================
+# AegisTune  BBR + ${QDISC_CHOICE^^}   (纯 BBR + qdisc + BDP 缓冲)
+# 生成时间: $(date)
+# 缓冲 = 2×BDP (${BDP_BW_MBPS}Mbps × ${BDP_RTT_MS}ms) ≈ ${_buf_mib} MiB
+# ================================================
 net.core.default_qdisc = $QDISC_CHOICE
 net.ipv4.tcp_congestion_control = bbr
-
-# === 协议栈优化 ===
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
-
-# === 连接管理 ===
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 3
-
-# === 由 bpftune 自动调整的参数 (不设固定值) ===
-# net.core.rmem_max - bpftune 自动调整
-# net.core.wmem_max - bpftune 自动调整
-# net.ipv4.tcp_rmem - bpftune 自动调整
-# net.ipv4.tcp_wmem - bpftune 自动调整
-
-# === 系统保护 ===
-kernel.panic = 10
-vm.swappiness = 10
-fs.file-max = 1000000"
+net.core.rmem_max = $_buf
+net.core.wmem_max = $_buf
+net.core.rmem_default = $_def
+net.core.wmem_default = $_def
+net.ipv4.tcp_rmem = 4096 $_mid $_buf
+net.ipv4.tcp_wmem = 4096 $_mid $_buf"
 
     # 写入 sysctl.d 目录
     mkdir -p /etc/sysctl.d
@@ -823,535 +804,6 @@ verify_bbr_effective() {
     fi
 }
 
-apply_aggressive_sysctl_overlay() {
-    # 动态计算更高的缓冲上限：约 MemAvailable/16，范围 [16MB, 64MB]
-    local avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    local target=$((avail_kb * 1024 / 16))
-    local floor=$((16 * 1024 * 1024))
-    local cap=$((64 * 1024 * 1024))
-    if (( target < floor )); then target=$floor; fi
-    if (( target > cap )); then target=$cap; fi
-
-    local rmem_max=$target
-    local wmem_max=$target
-    local rmem_def=$((rmem_max / 4))
-    local wmem_def=$((wmem_max / 4))
-
-    cat > /etc/sysctl.d/99-bbr-aggressive.conf <<EOF
-# AegisTune 动态缓冲上限 (bpftune 叠加) - 运行时计算
-net.core.rmem_max = $rmem_max
-net.core.wmem_max = $wmem_max
-net.core.rmem_default = $rmem_def
-net.core.wmem_default = $wmem_def
-net.ipv4.tcp_rmem = 4096 $rmem_def $rmem_max
-net.ipv4.tcp_wmem = 4096 $wmem_def $wmem_max
-EOF
-
-    sysctl -p /etc/sysctl.d/99-bbr-aggressive.conf 2>/dev/null || true
-    log_info "已应用动态缓冲上限 (约 MemAvailable/16，封顶 64MB)"
-}
-
-install_bpftune() {
-    log_section "安装 bpftune"
-    
-    # 检查是否已安装
-    if command -v bpftune &> /dev/null; then
-        log_success "bpftune 已安装: $(bpftune -V 2>/dev/null || echo 'installed')"
-        return 0
-    fi
-    
-    case $PKG_MANAGER in
-        apt)
-            # 优先从官方仓库安装
-            if apt-cache show bpftune &> /dev/null; then
-                log_info "从官方仓库安装 bpftune..."
-                apt-get install -y -qq bpftune
-            else
-                log_info "官方仓库无 bpftune，尝试从源码编译..."
-                install_bpftune_from_source
-            fi
-            ;;
-        apk)
-            log_info "Alpine: 尝试从源码编译 bpftune..."
-            install_bpftune_from_source
-            ;;
-        dnf|yum)
-            log_info "RPM 系: 尝试从源码编译 bpftune..."
-            install_bpftune_from_source
-            ;;
-    esac
-    
-    if command -v bpftune &> /dev/null; then
-        log_success "bpftune 安装成功"
-    else
-        log_warn "bpftune 安装失败，使用静态缓冲区配置"
-        configure_static_buffers
-    fi
-}
-
-install_bpftune_from_source() {
-    # 清理函数，确保无论成功或失败都删除临时构建目录与残留服务
-    rollback_bpftune_install() {
-        rm -f /usr/sbin/bpftune /usr/local/sbin/bpftune /usr/bin/bpftune
-        rm -f /lib/systemd/system/bpftune.service /etc/systemd/system/bpftune.service
-        service_daemon_reload
-    }
-
-    cleanup_build_cache() {
-        case $PKG_MANAGER in
-            apt)
-                apt-get clean >/dev/null 2>&1 || true
-                ;;
-            apk)
-                apk cache clean >/dev/null 2>&1 || true
-                ;;
-            dnf|yum)
-                $PKG_MANAGER clean all >/dev/null 2>&1 || true
-                ;;
-        esac
-    }
-
-    # Alpine 低内存环境临时 swap，避免编译被 OOM 杀
-    local TEMP_SWAP=""
-    ensure_temp_swap_for_build() {
-        if [[ "$PKG_MANAGER" == "apk" ]]; then
-            if ! swapon --show | grep -q '^'; then
-                TEMP_SWAP="/tmp/bpftune.swap"
-                log_info "检测到无 swap，为编译临时创建 1G swap..."
-                fallocate -l 1024M "$TEMP_SWAP" 2>/dev/null || dd if=/dev/zero of="$TEMP_SWAP" bs=1M count=1024
-                chmod 600 "$TEMP_SWAP"
-                mkswap "$TEMP_SWAP" >/dev/null 2>&1 && swapon "$TEMP_SWAP" >/dev/null 2>&1 || TEMP_SWAP=""
-            fi
-        fi
-    }
-
-    cleanup_temp_swap() {
-        if [[ -n "$TEMP_SWAP" ]]; then
-            swapoff "$TEMP_SWAP" 2>/dev/null || true
-            rm -f "$TEMP_SWAP"
-        fi
-    }
-
-    build_bpftool_alpine() {
-        local bdir="/tmp/bpftool-src"
-        local blog="/tmp/bpftool-build.log"
-        rm -rf "$bdir" "$blog"
-        apk add --quiet --no-cache \
-            build-base clang llvm lld pkgconf linux-headers \
-            elfutils-dev zlib-dev bison flex libcap-dev 2>>"$blog" || true
-        if git clone --depth 1 https://github.com/libbpf/bpftool.git "$bdir" >>"$blog" 2>&1; then
-            make -C "$bdir/src" install PREFIX=/usr >>"$blog" 2>&1 || true
-        fi
-        if ! command -v bpftool >/dev/null 2>&1; then
-            log_warn "bpftool 构建失败，日志尾部："
-            tail -n 20 "$blog" 2>/dev/null || true
-            log_info "完整日志: $blog"
-        fi
-        rm -rf "$bdir"
-    }
-
-    # 安装编译依赖
-    case $PKG_MANAGER in
-        apt)
-            apt-get install -y -qq \
-                build-essential git libbpf-dev libnl-3-dev \
-                libnl-genl-3-dev libnl-route-3-dev pkg-config \
-                clang llvm libelf-dev bpftool python3-docutils \
-                python3-yaml libyaml-dev libxml2-dev 2>/dev/null || true
-            apt-get install -y -qq libcap-dev 2>/dev/null || true
-
-            # 确保 bpftool 可用，否则 bpftune 编译会失败
-            if ! command -v bpftool &> /dev/null; then
-                log_warn "bpftool 缺失，尝试单独安装..."
-                apt-get install -y -qq bpftool 2>/dev/null || true
-            fi
-            ;;
-        apk)
-            # Alpine: 若缺 BTF，bpftune 运行有限；提前告警
-            if [[ ! -f /sys/kernel/btf/vmlinux ]]; then
-                log_warn "Alpine: 未发现 /sys/kernel/btf/vmlinux，bpftune 功能可能受限或编译失败，将尝试编译，失败则回退静态配置"
-            fi
-
-            apk add --quiet --no-cache \
-                build-base git clang llvm lld pkgconf \
-                linux-headers bpftool libbpf-dev elfutils-dev \
-                py3-docutils py3-yaml libyaml-dev libxml2-dev \
-                libcap-dev libelf-static zlib-static 2>/dev/null || true
-
-            # Alpine 确认 bpftool
-            if ! command -v bpftool &> /dev/null; then
-            log_warn "bpftool 在 Alpine 不可用，尝试源码构建..."
-            build_bpftool_alpine
-        fi
-
-        if ! command -v bpftool &> /dev/null; then
-            log_warn "bpftool 仍不可用，跳过 bpftune 编译（保持静态配置）。参考 /tmp/bpftool-build.log 查看详情。"
-            return 0
-        fi
-            ;;
-        dnf|yum)
-            $PKG_MANAGER -y -q install \
-                git gcc make clang llvm pkg-config bpftool \
-                libbpf-devel libnl3-devel libcap-devel elfutils-libelf-devel \
-                libyaml-devel libxml2-devel python3-docutils python3-pyyaml 2>/dev/null || true
-            $PKG_MANAGER -y -q install kernel-devel kernel-headers 2>/dev/null || true
-            if ! command -v bpftool &> /dev/null; then
-                log_warn "bpftool 不可用，跳过 bpftune 编译，改用静态缓冲配置"
-                configure_static_buffers
-                return 0
-            fi
-            ;;
-    esac
-
-    if ! command -v bpftool &> /dev/null; then
-        log_warn "bpftool 仍不可用，跳过 bpftune 编译，改用静态缓冲配置"
-        configure_static_buffers
-        return 0
-    fi
-
-    ensure_temp_swap_for_build
-
-    # 尝试安装内核头文件
-    case $PKG_MANAGER in
-        apt)
-            apt-get install -y -qq linux-headers-$(uname -r) 2>/dev/null || \
-            apt-get install -y -qq linux-headers-generic 2>/dev/null || true
-            ;;
-        apk)
-            # linux-headers 已在上方尝试安装；Alpine 无 generic 兜底
-            true
-            ;;
-        dnf|yum)
-            $PKG_MANAGER -y -q install kernel-devel kernel-headers 2>/dev/null || true
-            ;;
-    esac
-
-    local build_dir="/tmp/bpftune-build"
-    local build_log="/tmp/bpftune-build.log"
-    rm -rf "$build_dir"
-    trap 'rm -rf "$build_dir"' EXIT
-    
-    if git clone --depth 1 https://github.com/oracle/bpftune.git "$build_dir" 2>/dev/null; then
-        cd "$build_dir"
-        : > "$build_log"
-        local jobs=$(nproc)
-        [[ "$PKG_MANAGER" == "apk" ]] && jobs=1
-        if make -j${jobs} >>"$build_log" 2>&1 && make install >>"$build_log" 2>&1; then
-            log_success "bpftune 从源码编译成功"
-        else
-            log_warn "bpftune 编译失败，回滚并使用静态缓冲配置"
-            log_info "编译日志尾部（/tmp/bpftune-build.log）:"
-            tail -n 20 "$build_log" 2>/dev/null || true
-            rollback_bpftune_install
-            configure_static_buffers
-            cleanup_build_cache
-        fi
-        cd /
-    else
-        log_warn "git 克隆 bpftune 失败，尝试下载 tarball..."
-        local tarball="/tmp/bpftune.tar.gz"
-        rm -f "$tarball" && rm -rf "$build_dir"
-        if curl -fsSL https://github.com/oracle/bpftune/archive/refs/heads/master.tar.gz -o "$tarball"; then
-            local extracted
-            extracted=$(tar -tzf "$tarball" | head -1 | cut -d/ -f1)
-            tar -xzf "$tarball" -C /tmp
-            mv "/tmp/$extracted" "$build_dir" 2>/dev/null || true
-            if [[ -d "$build_dir" ]]; then
-                cd "$build_dir"
-                : > "$build_log"
-                if make -j$(nproc) >>"$build_log" 2>&1 && make install >>"$build_log" 2>&1; then
-                    log_success "bpftune 从 tarball 编译成功"
-                else
-                    log_warn "bpftune 编译失败，回滚并使用静态缓冲配置"
-                    log_info "编译日志尾部（/tmp/bpftune-build.log）:"
-                    tail -n 20 "$build_log" 2>/dev/null || true
-                    rollback_bpftune_install
-                    configure_static_buffers
-                    cleanup_build_cache
-                fi
-                cd /
-            else
-                log_warn "tarball 展开失败，使用静态缓冲配置"
-                rollback_bpftune_install
-                configure_static_buffers
-                cleanup_build_cache
-            fi
-        else
-            log_warn "无法下载 bpftune 源码，使用静态缓冲配置"
-            rollback_bpftune_install
-            configure_static_buffers
-            cleanup_build_cache
-        fi
-    fi
-    
-    # 主动清理构建目录
-    rm -rf "$build_dir"
-    cleanup_build_cache
-}
-
-# ============ TCP Brutal (hy2) ============ 
-# 需要内核 >=4.9，建议 >=5.8；构建需要内核头、git、编译链。
-
-check_tcp_brutal_status() {
-    if is_tcp_brutal_loaded; then
-        echo -e "${CYAN}│${NC}  TCP Brutal:   ${GREEN}已加载模块 (brutal)${NC}"
-    elif is_tcp_brutal_installed; then
-        echo -e "${CYAN}│${NC}  TCP Brutal:   ${YELLOW}已安装但未加载${NC}"
-    else
-        echo -e "${CYAN}│${NC}  TCP Brutal:   ${YELLOW}未加载/未安装${NC}"
-    fi
-}
-
-install_tcp_brutal() {
-    log_section "安装/编译 TCP Brutal (hy2)"
-    ensure_brutal_not_default
-    detect_os
-    detect_pkg_manager
-    detect_kernel
-
-    cleanup_brutal_cache() {
-        case $PKG_MANAGER in
-            apt) apt-get clean >/dev/null 2>&1 || true ;;
-            apk) apk cache clean >/dev/null 2>&1 || true ;;
-        esac
-    }
-
-    rollback_brutal_install() {
-        # 卸载已加载模块并删除可能安装的 ko 文件
-        remove_tcp_brutal
-        cleanup_brutal_cache
-    }
-
-    case $PKG_MANAGER in
-        apt)
-            apt-get update -qq
-            apt-get install -y -qq git build-essential 2>/dev/null || true
-            # 优先安装当前运行内核的头文件与镜像（确保 build 目录存在）
-            apt-get install -y -qq linux-headers-$(uname -r) linux-image-$(uname -r) 2>/dev/null || true
-            # 若仍缺，再尝试通用元包，可能会安装新内核，需重启后重试
-            if [[ ! -d "/lib/modules/$(uname -r)/build" ]]; then
-                apt-get install -y -qq linux-headers-amd64 linux-image-amd64 2>/dev/null || true
-            fi
-            ;;
-        apk)
-            apk add --quiet --no-cache git build-base linux-headers 2>/dev/null || true
-            ;;
-        dnf|yum)
-            $PKG_MANAGER -y -q install git gcc make clang llvm kernel-devel kernel-headers elfutils-libelf-devel bpftool 2>/dev/null || true
-            ;;
-    esac
-
-    local build_dir="/tmp/tcp-brutal"
-    local build_log="/tmp/tcp-brutal-build.log"
-    rm -rf "$build_dir"
-    : > "$build_log"
-
-    # 若头文件依旧缺失，直接提示并退出
-    if [[ ! -d "/lib/modules/$(uname -r)/build" ]]; then
-        local running_kver
-        running_kver="$(uname -r)"
-        local latest_kver=""
-        latest_kver="$(ls -1 /lib/modules 2>/dev/null | sort -V | tail -1)"
-        log_warn "未找到内核头文件目录 /lib/modules/${running_kver}/build，请先安装匹配内核头或重启到已安装的新内核。"
-        {
-            echo "建议:"
-            echo "1) apt-get install linux-headers-${running_kver}"
-            echo "2) 若已安装新内核且有 /lib/modules/${latest_kver}/build，可重启后再运行"
-            echo "3) 确认 /lib/modules/\$(uname -r)/build 存在后重试"
-            echo "4) 如 meta 包已装（linux-image-amd64 / linux-headers-amd64），请重启以启用新内核后再运行"
-        } | tee -a "$build_log"
-        cleanup_brutal_cache
-        return 1
-    fi
-    if ! git clone --depth 1 https://github.com/apernet/tcp-brutal.git "$build_dir" >>"$build_log" 2>&1; then
-        log_warn "无法克隆 tcp-brutal 仓库"
-        cleanup_brutal_cache
-        return 1
-    fi
-
-    pushd "$build_dir" >/dev/null
-    if make -C /lib/modules/$(uname -r)/build M="$build_dir" modules >>"$build_log" 2>&1; then
-        # 直接 insmod 避免 Makefile 里的 sudo 依赖
-        if insmod "$build_dir/brutal.ko" >>"$build_log" 2>&1; then
-            depmod -a 2>/dev/null || true
-            log_success "TCP Brutal 编译并加载成功 (模块名: brutal)"
-            log_info "注意：不要将 brutal 设为全局拥塞控制，仅在支持的应用中按需启用。"
-            warn_brutal_usage
-        else
-            log_warn "TCP Brutal 编译成功但加载失败，查看 /tmp/tcp-brutal-build.log 获取详情"
-            rollback_brutal_install
-            popd >/dev/null
-            rm -rf "$build_dir"
-            return 1
-        fi
-    else
-        log_warn "TCP Brutal 编译失败，查看 /tmp/tcp-brutal-build.log 获取详情"
-        rollback_brutal_install
-        popd >/dev/null
-        rm -rf "$build_dir"
-        return 1
-    fi
-    popd >/dev/null
-    rm -rf "$build_dir"
-    cleanup_brutal_cache
-}
-
-remove_tcp_brutal() {
-    log_section "卸载/停用 TCP Brutal"
-    local was_loaded=0
-    local was_installed=0
-
-    is_tcp_brutal_loaded && was_loaded=1
-    is_tcp_brutal_installed && was_installed=1
-
-    if is_tcp_brutal_loaded; then
-        modprobe -r brutal 2>/dev/null || rmmod brutal 2>/dev/null || true
-    fi
-    # 清理可能的已安装模块文件
-    find /lib/modules -type f -name "brutal.ko*" -delete 2>/dev/null || true
-    depmod -a 2>/dev/null || true
-
-    if is_tcp_brutal_loaded || is_tcp_brutal_installed; then
-        log_warn "TCP Brutal 仍检测到残留，请手动检查 /lib/modules 与 lsmod"
-        return 1
-    fi
-
-    if [[ $was_loaded -eq 0 && $was_installed -eq 0 ]]; then
-        log_info "未检测到 TCP Brutal，已完成残留文件清理检查"
-    else
-        log_success "TCP Brutal 已彻底清理完成"
-    fi
-}
-
-# ============ brutal-nginx 动态模块 (针对 nginx 动态模块) ============
-
-install_brutal_nginx_module() {
-    log_section "安装 brutal-nginx 动态模块"
-
-    detect_os
-    detect_pkg_manager
-
-    cleanup_brutal_nginx_cache() {
-        case $PKG_MANAGER in
-            apt) apt-get clean >/dev/null 2>&1 || true ;;
-            apk) apk cache clean >/dev/null 2>&1 || true ;;
-        esac
-    }
-
-    rollback_brutal_nginx() {
-        rm -f /etc/nginx/modules/ngx_http_tcp_brutal_module.so
-        # 清理配置中的 load_module 行
-        if [[ -f /etc/nginx/nginx.conf ]]; then
-            sed -i '/ngx_http_tcp_brutal_module.so/d' /etc/nginx/nginx.conf
-        fi
-        cleanup_brutal_nginx_cache
-    }
-
-    case $PKG_MANAGER in
-        apt)
-            apt-get update -qq
-            apt-get install -y -qq nginx git build-essential libpcre3-dev zlib1g-dev libssl-dev wget curl 2>/dev/null || true
-            ;;
-        apk)
-            apk add --quiet --no-cache nginx git build-base pcre-dev zlib-dev openssl-dev wget curl 2>/dev/null || true
-            ;;
-    esac
-
-    if ! command -v nginx >/dev/null; then
-        log_warn "未检测到 nginx，可手动安装后重试"
-        cleanup_brutal_nginx_cache
-        return 1
-    fi
-
-    local nginx_ver
-    nginx_ver=$(nginx -v 2>&1 | sed 's#.*/##' | sed 's/nginx\///')
-    if [[ -z "$nginx_ver" ]]; then
-        log_warn "无法获取 nginx 版本"
-        cleanup_brutal_nginx_cache
-        return 1
-    fi
-
-    local build_dir="/tmp/brutal-nginx"
-    local nginx_src="/tmp/nginx-${nginx_ver}"
-    local build_log="/tmp/brutal-nginx-build.log"
-    rm -rf "$build_dir" "$nginx_src"
-    : > "$build_log"
-
-    if ! git clone --depth 1 https://github.com/sduoduo233/brutal-nginx.git "$build_dir" >>"$build_log" 2>&1; then
-        log_warn "克隆 brutal-nginx 失败，查看日志 $build_log"
-        cleanup_brutal_nginx_cache
-        return 1
-    fi
-
-    if ! curl -fsSL "http://nginx.org/download/nginx-${nginx_ver}.tar.gz" -o "/tmp/nginx-${nginx_ver}.tar.gz"; then
-        log_warn "下载 nginx 源码失败"
-        rollback_brutal_nginx
-        return 1
-    fi
-
-    if ! tar -xf "/tmp/nginx-${nginx_ver}.tar.gz" -C /tmp; then
-        log_warn "解压 nginx 源码失败"
-        rollback_brutal_nginx
-        return 1
-    fi
-
-    pushd "$nginx_src" >/dev/null
-    if ./configure --with-compat --add-dynamic-module="$build_dir" >>"$build_log" 2>&1 && make modules >>"$build_log" 2>&1; then
-        mkdir -p /etc/nginx/modules
-        cp objs/ngx_http_tcp_brutal_module.so /etc/nginx/modules/ 2>/dev/null || true
-        if [[ ! -f /etc/nginx/modules/ngx_http_tcp_brutal_module.so ]]; then
-            log_warn "未找到编译生成的模块文件，查看 $build_log"
-            rollback_brutal_nginx
-            popd >/dev/null
-            rm -rf "$build_dir" "$nginx_src" "/tmp/nginx-${nginx_ver}.tar.gz"
-            return 1
-        fi
-        if ! grep -q "ngx_http_tcp_brutal_module.so" /etc/nginx/nginx.conf 2>/dev/null; then
-            sed -i '1iload_module /etc/nginx/modules/ngx_http_tcp_brutal_module.so;' /etc/nginx/nginx.conf
-        fi
-        service_reload_or_restart_any nginx || nginx -s reload 2>/dev/null || true
-        log_success "brutal-nginx 模块安装完成 (ngx_http_tcp_brutal_module.so)"
-    else
-        log_warn "brutal-nginx 模块编译失败，查看 $build_log"
-        rollback_brutal_nginx
-        popd >/dev/null
-        rm -rf "$build_dir" "$nginx_src" "/tmp/nginx-${nginx_ver}.tar.gz"
-        return 1
-    fi
-    popd >/dev/null
-    rm -rf "$build_dir" "$nginx_src" "/tmp/nginx-${nginx_ver}.tar.gz"
-    cleanup_brutal_nginx_cache
-}
-
-remove_brutal_nginx_module() {
-    log_section "卸载 brutal-nginx 模块"
-    local found=0
-
-    if is_brutal_nginx_installed; then
-        found=1
-    fi
-
-    rm -f /etc/nginx/modules/ngx_http_tcp_brutal_module.so
-    rm -f /usr/lib/nginx/modules/ngx_http_tcp_brutal_module.so
-    rm -f /usr/lib64/nginx/modules/ngx_http_tcp_brutal_module.so
-    if [[ -f /etc/nginx/nginx.conf ]]; then
-        sed -i '/ngx_http_tcp_brutal_module.so/d' /etc/nginx/nginx.conf
-    fi
-    find /etc/nginx -type f \( -name "*.conf" -o -name "nginx.conf" \) \
-        -exec sed -i '/ngx_http_tcp_brutal_module.so/d' {} + 2>/dev/null || true
-    service_reload_or_restart_any nginx || nginx -s reload 2>/dev/null || true
-
-    if is_brutal_nginx_installed; then
-        log_warn "brutal-nginx 仍检测到残留模块，请手动检查 nginx 模块目录"
-        return 1
-    fi
-
-    if [[ $found -eq 0 ]]; then
-        log_info "未检测到 brutal-nginx，已完成残留配置清理检查"
-    else
-        log_success "brutal-nginx 模块已彻底卸载"
-    fi
-}
 
 # ============ Fail2ban 管理 (SSH 防暴力) ============
 
@@ -1979,22 +1431,94 @@ fail2ban_whitelist_menu() {
 
 # ============ Swap 管理 ============
 
+smart_swap_size_mb() {
+    local mem_mb disk_free_mb rec cap
+    mem_mb=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    [[ "$mem_mb" =~ ^[0-9]+$ ]] || mem_mb=1024
+    if   (( mem_mb < 512 ));  then rec=1024
+    elif (( mem_mb < 1024 )); then rec=$(( mem_mb * 2 ))
+    elif (( mem_mb < 2048 )); then rec=$(( mem_mb * 3 / 2 ))
+    elif (( mem_mb < 4096 )); then rec=$mem_mb
+    else rec=4096; fi
+    disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
+    [[ "$disk_free_mb" =~ ^[0-9]+$ ]] || disk_free_mb=0
+    cap=$(( disk_free_mb / 2 ))           # swap 不超过可用磁盘的 50%（防撑盘）
+    (( cap > 0 && rec > cap )) && rec=$cap
+    (( rec < 256 )) && rec=256
+    echo "$rec"
+}
+
 swap_create() {
     log_section "创建 Swap"
-    read -p "请输入 Swap 大小 (MB，默认 1024): " swap_size
-    [[ -z "$swap_size" ]] && swap_size=1024
+
+    # 检测已有 swap
+    local existing_swap
+    existing_swap=$(swapon --show 2>/dev/null | grep -v '^NAME' || true)
+    if [[ -n "$existing_swap" ]]; then
+        log_info "检测到已有 Swap:"
+        echo "$existing_swap"
+        echo ""
+        read -r -p "已有 Swap，是否替换？[y/N]: " replace_choice
+        if [[ "${replace_choice,,}" != "y" ]]; then
+            log_info "已跳过 Swap 创建"
+            return 0
+        fi
+    fi
+
+    # 推荐大小
+    local rec_mb
+    rec_mb=$(smart_swap_size_mb)
+    log_info "推荐 Swap 大小: ${rec_mb}MB（基于内存和磁盘余量）"
+    read -r -p "请输入 Swap 大小 (MB，回车使用推荐值 ${rec_mb}): " swap_size
+    [[ -z "$swap_size" ]] && swap_size=$rec_mb
+    if ! [[ "$swap_size" =~ ^[0-9]+$ ]] || (( swap_size < 256 )); then
+        log_error "无效大小: ${swap_size}，最小 256MB"
+        return 1
+    fi
+
+    # 磁盘余量护栏
+    local disk_free_mb
+    disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
+    [[ "$disk_free_mb" =~ ^[0-9]+$ ]] || disk_free_mb=0
+    local needed=$(( swap_size + 64 ))
+    if (( disk_free_mb < needed )); then
+        log_error "磁盘剩余 ${disk_free_mb}MB 不足（需要 ${needed}MB），中止创建"
+        return 1
+    fi
+
     swapoff /swapfile 2>/dev/null || true
     rm -f /swapfile
+
     if ! fallocate -l ${swap_size}M /swapfile 2>/dev/null; then
-        dd if=/dev/zero of=/swapfile bs=1M count=${swap_size}
+        log_info "fallocate 不可用，回退到 dd..."
+        if ! dd if=/dev/zero of=/swapfile bs=1M count=${swap_size} 2>/dev/null; then
+            log_error "Swap 文件创建失败"
+            rm -f /swapfile
+            return 1
+        fi
     fi
     chmod 600 /swapfile
     mkswap /swapfile
     swapon /swapfile
+
     if ! grep -q "/swapfile" /etc/fstab; then
         echo "/swapfile none swap sw 0 0" >> /etc/fstab
     fi
-    log_success "Swap 已创建并启用: ${swap_size}MB"
+
+    # 设置 swappiness
+    local mem_mb
+    mem_mb=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    [[ "$mem_mb" =~ ^[0-9]+$ ]] || mem_mb=2048
+    local swappiness=10
+    (( mem_mb < 2048 )) && swappiness=20
+    sysctl -w vm.swappiness=$swappiness >/dev/null 2>&1 || true
+    if grep -q "vm.swappiness" /etc/sysctl.conf 2>/dev/null; then
+        sed -i "s/^vm.swappiness.*/vm.swappiness = $swappiness/" /etc/sysctl.conf
+    else
+        echo "vm.swappiness = $swappiness" >> /etc/sysctl.conf
+    fi
+
+    log_success "Swap 已创建并启用: ${swap_size}MB (swappiness=${swappiness})"
 }
 
 swap_delete() {
@@ -3136,197 +2660,6 @@ net.ipv4.tcp_wmem = 4096 65536 16777216"
     fi
 }
 
-setup_bpftune_service() {
-    log_section "配置 bpftune 服务"
-    
-    if ! command -v bpftune &> /dev/null; then
-        log_info "bpftune 未安装，跳过服务配置"
-        return 0
-    fi
-    
-    case $INIT_SYSTEM in
-        systemd)
-            # 避免 systemctl 回退到 SysV：如存在旧版 /etc/init.d/bpftune 但无 LSB 头，则先移除
-            if [[ -f /etc/init.d/bpftune ]]; then
-                mv /etc/init.d/bpftune /etc/init.d/bpftune.disabled.$$ 2>/dev/null || rm -f /etc/init.d/bpftune
-            fi
-
-            local BPFTUNE_BIN
-            BPFTUNE_BIN=$(command -v bpftune || echo /usr/sbin/bpftune)
-
-            # 检查是否已有服务文件
-            if [[ ! -f /lib/systemd/system/bpftune.service ]] && \
-               [[ ! -f /etc/systemd/system/bpftune.service ]]; then
-                cat > /etc/systemd/system/bpftune.service <<EOF
-[Unit]
-Description=BPF auto-tuning daemon
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${BPFTUNE_BIN} -s
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            fi
-            
-            service_daemon_reload
-            service_enable_any bpftune || true
-            service_action_any restart bpftune || service_action_any start bpftune || true
-
-            if service_is_active_any bpftune; then
-                log_success "bpftune 服务已启动"
-            else
-                log_warn "bpftune 服务启动失败"
-                log_info "查看日志: journalctl -u bpftune -n 20"
-            fi
-            ;;
-        openrc)
-            local BPFTUNE_BIN
-            BPFTUNE_BIN=$(command -v bpftune || echo /usr/sbin/bpftune)
-
-            cat > /etc/init.d/bpftune <<'INITEOF'
-#!/sbin/openrc-run
-name="bpftune"
-description="BPF auto-tuning daemon"
-command="BPFTUNE_BIN_PLACEHOLDER"
-command_args="-s"
-command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
-depend() { need net; }
-INITEOF
-            # 替换占位符为实际路径
-            sed -i "s|BPFTUNE_BIN_PLACEHOLDER|${BPFTUNE_BIN}|g" /etc/init.d/bpftune
-            chmod +x /etc/init.d/bpftune
-            service_enable_any bpftune || true
-            service_action_any start bpftune || true
-            log_success "bpftune OpenRC 服务已配置"
-            ;;
-        sysv)
-            local BPFTUNE_BIN
-            BPFTUNE_BIN=$(command -v bpftune || echo /usr/sbin/bpftune)
-
-            cat > /etc/init.d/bpftune <<'INITEOF'
-#!/bin/sh
-### BEGIN INIT INFO
-# Provides:          bpftune
-# Required-Start:    $network $remote_fs
-# Required-Stop:     $network $remote_fs
-# Default-Start:     2 3 4 5
-# Default-Stop:      0 1 6
-# Short-Description: BPF auto-tuning daemon
-### END INIT INFO
-BIN="BPFTUNE_BIN_PLACEHOLDER"
-PIDFILE="/run/bpftune.pid"
-case "$1" in
-    start)
-        echo "Starting bpftune"
-        if command -v start-stop-daemon >/dev/null 2>&1; then
-            start-stop-daemon --start --background --make-pidfile --pidfile "$PIDFILE" --exec "$BIN" -- -s
-        else
-            "$BIN" -s &
-            echo $! > "$PIDFILE"
-        fi
-        ;;
-    stop)
-        echo "Stopping bpftune"
-        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
-        rm -f "$PIDFILE"
-        ;;
-    restart)
-        "$0" stop; "$0" start ;;
-    status)
-        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-            echo "bpftune running"
-        else
-            echo "bpftune not running"; exit 1
-        fi
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
-esac
-exit 0
-INITEOF
-            sed -i "s|BPFTUNE_BIN_PLACEHOLDER|${BPFTUNE_BIN}|g" /etc/init.d/bpftune
-            chmod +x /etc/init.d/bpftune
-            service_enable_any bpftune || true
-            service_action_any start bpftune || true
-            log_success "bpftune SysV 服务已配置"
-            ;;
-        *)
-            log_warn "未知 init 系统 (${INIT_SYSTEM})，bpftune 已安装但未配置为开机服务；可手动运行: bpftune -s &"
-            ;;
-    esac
-}
-
-remove_bpftune() {
-    log_section "检测并移除 bpftune"
-
-    local found=0
-    local removed=0
-
-    if command -v bpftune &>/dev/null; then
-        found=1
-        log_info "检测到 bpftune 可执行文件: $(command -v bpftune)"
-    fi
-
-    service_action_any stop bpftune || true
-    service_disable_any bpftune || true
-
-    rm -f /etc/systemd/system/bpftune.service /lib/systemd/system/bpftune.service /etc/init.d/bpftune
-    service_daemon_reload
-
-    case $PKG_MANAGER in
-        apt)
-            if dpkg -s bpftune >/dev/null 2>&1; then
-                apt-get remove -y -qq bpftune >/dev/null 2>&1 || true
-                removed=1
-            fi
-            ;;
-        apk)
-            if apk info -e bpftune >/dev/null 2>&1; then
-                apk del --quiet bpftune >/dev/null 2>&1 || true
-                removed=1
-            fi
-            ;;
-        dnf|yum)
-            if rpm -q bpftune >/dev/null 2>&1; then
-                $PKG_MANAGER -y -q remove bpftune >/dev/null 2>&1 || true
-                removed=1
-            fi
-            ;;
-    esac
-
-    local candidates=(
-        /usr/sbin/bpftune
-        /usr/local/sbin/bpftune
-        /usr/bin/bpftune
-        /usr/local/bin/bpftune
-    )
-    local bin_path
-    for bin_path in "${candidates[@]}"; do
-        if [[ -e "$bin_path" ]]; then
-            rm -f "$bin_path"
-            removed=1
-        fi
-    done
-    hash -r 2>/dev/null || true
-
-    if command -v bpftune &>/dev/null; then
-        log_warn "bpftune 仍可执行，请手动检查 PATH 中残留文件"
-        return 1
-    fi
-
-    if [[ $found -eq 0 && $removed -eq 0 ]]; then
-        log_info "未检测到 bpftune，已完成残留服务/文件清理检查"
-    else
-        log_success "bpftune 已清理完成"
-    fi
-}
-
 snapshot_tracked_files() {
     cat <<'EOF'
 /etc/sysctl.conf
@@ -3346,375 +2679,9 @@ snapshot_tracked_files() {
 EOF
 }
 
-provider_tuning_keys() {
-    cat <<'EOF'
-net.core.default_qdisc
-net.ipv4.tcp_congestion_control
-net.core.somaxconn
-net.ipv4.tcp_max_syn_backlog
-net.core.netdev_max_backlog
-net.core.rmem_max
-net.core.wmem_max
-net.ipv4.tcp_rmem
-net.ipv4.tcp_wmem
-net.ipv4.tcp_adv_win_scale
-net.ipv4.tcp_sack
-net.ipv4.tcp_timestamps
-net.ipv4.tcp_window_scaling
-net.ipv4.tcp_tw_reuse
-net.ipv4.tcp_fin_timeout
-net.ipv4.tcp_fastopen
-net.ipv4.tcp_mtu_probing
-net.ipv4.tcp_keepalive_time
-net.ipv4.tcp_keepalive_intvl
-net.ipv4.tcp_keepalive_probes
-net.core.rmem_default
-net.core.wmem_default
-fs.file-max
-kernel.panic
-vm.swappiness
-vm.overcommit_memory
-EOF
-}
-
-is_managed_sysctl_file() {
-    local file="$1"
-    case "$file" in
-        /etc/sysctl.d/99-bbr-tuning.conf|\
-        /etc/sysctl.d/99-bbr-aggressive.conf|\
-        /etc/sysctl.d/99-cc.conf|\
-        /etc/sysctl.d/99-aegistune-serverspan.conf|\
-        /etc/sysctl.d/99-aegistune-smart-bdp.conf|\
-        /etc/sysctl.d/99-aegistune-auto-merged.conf|\
-        /etc/sysctl.d/99-aegistune-forwarding.conf|\
-        /etc/sysctl.d/99-aegistune-provider-baseline-restore.conf)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-collect_sysctl_source_files() {
-    local include_managed="${1:-0}"
-    local files=()
-    local dir
-
-    for dir in /usr/lib/sysctl.d /usr/local/lib/sysctl.d /lib/sysctl.d /run/sysctl.d /etc/sysctl.d; do
-        [[ -d "$dir" ]] || continue
-        while IFS= read -r conf; do
-            [[ -z "$conf" ]] && continue
-            if [[ "$include_managed" != "1" ]] && is_managed_sysctl_file "$conf"; then
-                continue
-            fi
-            files+=("$conf")
-        done < <(find "$dir" -maxdepth 1 -type f -name "*.conf" 2>/dev/null | sort)
-    done
-
-    if [[ -f /etc/sysctl.conf ]]; then
-        files+=("/etc/sysctl.conf")
-    fi
-
-    printf '%s\n' "${files[@]}"
-}
-
-sysctl_kv_get() {
-    local key="$1"
-    local file="$2"
-    local key_re="${key//./\\.}"
-    grep -E "^[[:space:]]*${key_re}[[:space:]]*=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//'
-}
-
-write_current_provider_tuning_kv() {
-    while IFS= read -r key; do
-        [[ -z "$key" ]] && continue
-        local value
-        value=$(sysctl -n "$key" 2>/dev/null || echo "__unsupported__")
-        echo "${key}=${value}"
-    done < <(provider_tuning_keys)
-}
-
-seed_provider_baseline_from_sysctl_sources() {
-    local files=()
-    while IFS= read -r conf; do
-        [[ -z "$conf" ]] && continue
-        files+=("$conf")
-    done < <(collect_sysctl_source_files 0)
-
-    [[ ${#files[@]} -eq 0 ]] && return 1
-
-    : > "$PROVIDER_BASELINE_FILE"
-    : > "$PROVIDER_BASELINE_SOURCEMAP"
-
-    while IFS= read -r key; do
-        [[ -z "$key" ]] && continue
-        local value=""
-        local source_file="__kernel_default__"
-        local conf
-        for conf in "${files[@]}"; do
-            local candidate
-            candidate=$(sysctl_kv_get "$key" "$conf")
-            if [[ -n "$candidate" ]]; then
-                value="$candidate"
-                source_file="$conf"
-            fi
-        done
-
-        if [[ -n "$value" ]]; then
-            echo "${key}=${value}" >> "$PROVIDER_BASELINE_FILE"
-            echo "${key}|${source_file}|${value}" >> "$PROVIDER_BASELINE_SOURCEMAP"
-        else
-            echo "${key}=__not_set_in_sysctl_files__" >> "$PROVIDER_BASELINE_FILE"
-            echo "${key}|__kernel_default__|__not_set_in_sysctl_files__" >> "$PROVIDER_BASELINE_SOURCEMAP"
-        fi
-    done < <(provider_tuning_keys)
-
-    {
-        echo "source=sysctl_source_scrape"
-        echo "captured_at=$(date '+%Y-%m-%d %H:%M:%S')"
-        echo "snapshot=none"
-    } > "$PROVIDER_BASELINE_META"
-    return 0
-}
-
-seed_provider_baseline_from_snapshot() {
-    local oldest_snapshot
-    oldest_snapshot=$(ls -1dt "${SNAPSHOT_ROOT}"/snapshot-* 2>/dev/null | tail -1)
-    [[ -z "$oldest_snapshot" ]] && return 1
-
-    local old_conf="${oldest_snapshot}/files/etc/sysctl.conf"
-    [[ -f "$old_conf" ]] || return 1
-
-    : > "$PROVIDER_BASELINE_FILE"
-    : > "$PROVIDER_BASELINE_SOURCEMAP"
-    while IFS= read -r key; do
-        [[ -z "$key" ]] && continue
-        local value
-        value=$(sysctl_kv_get "$key" "$old_conf")
-        if [[ -n "$value" ]]; then
-            echo "${key}=${value}" >> "$PROVIDER_BASELINE_FILE"
-            echo "${key}|${old_conf}|${value}" >> "$PROVIDER_BASELINE_SOURCEMAP"
-        else
-            echo "${key}=__not_set_in_snapshot__" >> "$PROVIDER_BASELINE_FILE"
-            echo "${key}|${old_conf}|__not_set_in_snapshot__" >> "$PROVIDER_BASELINE_SOURCEMAP"
-        fi
-    done < <(provider_tuning_keys)
-
-    {
-        echo "source=oldest_snapshot"
-        echo "captured_at=$(date '+%Y-%m-%d %H:%M:%S')"
-        echo "snapshot=$(basename "$oldest_snapshot")"
-    } > "$PROVIDER_BASELINE_META"
-    return 0
-}
-
-ensure_provider_baseline() {
-    mkdir -p "$SNAPSHOT_ROOT"
-    if [[ -f "$PROVIDER_BASELINE_FILE" ]]; then
-        return 0
-    fi
-
-    if seed_provider_baseline_from_sysctl_sources; then
-        log_info "已搜刮系统 sysctl 配置来源并生成服务商基线"
-        return 0
-    fi
-
-    if seed_provider_baseline_from_snapshot; then
-        log_info "已从最早快照推断服务商原始参数基线"
-        return 0
-    fi
-
-    write_current_provider_tuning_kv > "$PROVIDER_BASELINE_FILE"
-    : > "$PROVIDER_BASELINE_SOURCEMAP"
-    while IFS= read -r key; do
-        [[ -z "$key" ]] && continue
-        local v
-        v=$(provider_tuning_kv_read "$key" "$PROVIDER_BASELINE_FILE")
-        echo "${key}|runtime|${v}" >> "$PROVIDER_BASELINE_SOURCEMAP"
-    done < <(provider_tuning_keys)
-    {
-        echo "source=current_runtime"
-        echo "captured_at=$(date '+%Y-%m-%d %H:%M:%S')"
-        echo "snapshot=none"
-    } > "$PROVIDER_BASELINE_META"
-    log_info "首次记录当前参数为服务商基线（建议在首次调优前执行该检测）"
-}
-
-provider_tuning_kv_read() {
-    local key="$1"
-    local file="$2"
-    grep -E "^${key//./\\.}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-
-}
-
-scan_provider_tuning_sources() {
-    log_section "服务商参数来源扫描 (sysctl 配置文件)"
-    mkdir -p "$SNAPSHOT_ROOT"
-    local report_file="${SNAPSHOT_ROOT}/provider-source-report-$(date +%Y%m%d-%H%M%S).txt"
-    local files=()
-
-    while IFS= read -r conf; do
-        [[ -z "$conf" ]] && continue
-        files+=("$conf")
-    done < <(collect_sysctl_source_files 0)
-
-    if [[ ${#files[@]} -eq 0 ]]; then
-        log_warn "未发现可扫描的 sysctl 配置文件"
-        return 0
-    fi
-
-    {
-        echo "# provider source report"
-        echo "# generated_at: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "# scanned_files_count: ${#files[@]}"
-        echo ""
-        echo "[scanned_files]"
-        local file
-        for file in "${files[@]}"; do
-            echo "  ${file}"
-        done
-        echo ""
-    } > "$report_file"
-
-    local found_any=0
-    while IFS= read -r key; do
-        [[ -z "$key" ]] && continue
-        local key_re="${key//./\\.}"
-        local hits
-        hits=$(grep -HnE "^[[:space:]]*${key_re}[[:space:]]*=" "${files[@]}" 2>/dev/null || true)
-        if [[ -n "$hits" ]]; then
-            found_any=1
-            {
-                echo "[${key}]"
-                echo "$hits" | sed 's/^/  /'
-                echo ""
-            } >> "$report_file"
-        fi
-    done < <(provider_tuning_keys)
-
-    if [[ $found_any -eq 0 ]]; then
-        echo "[no_explicit_key_found]" >> "$report_file"
-        echo "  在配置文件中未找到关键参数显式声明，可能使用内核默认值" >> "$report_file"
-    fi
-
-    cat "$report_file"
-    log_info "来源扫描报告已保存: $report_file"
-}
-
-detect_provider_tuning_params() {
-    log_section "服务商原生调优参数检测"
-    ensure_provider_baseline
-
-    local current_kv
-    current_kv=$(mktemp)
-    write_current_provider_tuning_kv > "$current_kv"
-
-    local source captured snapshot
-    source=$(grep '^source=' "$PROVIDER_BASELINE_META" 2>/dev/null | cut -d= -f2-)
-    captured=$(grep '^captured_at=' "$PROVIDER_BASELINE_META" 2>/dev/null | cut -d= -f2-)
-    snapshot=$(grep '^snapshot=' "$PROVIDER_BASELINE_META" 2>/dev/null | cut -d= -f2-)
-    [[ -z "$source" ]] && source="unknown"
-    [[ -z "$captured" ]] && captured="unknown"
-    [[ -z "$snapshot" ]] && snapshot="unknown"
-
-    log_info "基线来源: ${source} | 记录时间: ${captured} | 参考快照: ${snapshot}"
-    if [[ -f "$PROVIDER_BASELINE_SOURCEMAP" ]]; then
-        log_info "基线来源映射文件: ${PROVIDER_BASELINE_SOURCEMAP}"
-    fi
-    if [[ "$source" == "current_runtime" ]]; then
-        log_warn "基线来自首次检测当下值，若此前已做过调优，这不是严格意义上的服务商出厂值"
-    fi
-    echo "参数 | 基线值 | 当前值 | 状态"
-    echo "-----|--------|--------|-----"
-
-    local changed=0
-    local unchanged=0
-    while IFS= read -r key; do
-        [[ -z "$key" ]] && continue
-        local base current status
-        base=$(provider_tuning_kv_read "$key" "$PROVIDER_BASELINE_FILE")
-        current=$(provider_tuning_kv_read "$key" "$current_kv")
-        [[ -z "$base" ]] && base="__unknown__"
-        [[ -z "$current" ]] && current="__unknown__"
-        if [[ "$base" == "$current" ]]; then
-            status="未变化"
-            unchanged=$((unchanged + 1))
-        else
-            status="已变化"
-            changed=$((changed + 1))
-        fi
-        echo "${key} | ${base} | ${current} | ${status}"
-    done < <(provider_tuning_keys)
-
-    rm -f "$current_kv"
-    log_info "对比完成: 已变化 ${changed} 项，未变化 ${unchanged} 项"
-    scan_provider_tuning_sources
-}
-
-rebuild_provider_baseline_from_sources() {
-    log_section "重建服务商参数基线 (搜刮系统配置来源)"
-    mkdir -p "$SNAPSHOT_ROOT"
-    rm -f "$PROVIDER_BASELINE_FILE" "$PROVIDER_BASELINE_META" "$PROVIDER_BASELINE_SOURCEMAP"
-
-    if seed_provider_baseline_from_sysctl_sources; then
-        log_success "服务商参数基线已重建 (来源: 系统 sysctl 配置搜刮)"
-        detect_provider_tuning_params
-        return 0
-    fi
-
-    log_warn "从系统配置搜刮基线失败，回退到当前运行参数"
-    write_current_provider_tuning_kv > "$PROVIDER_BASELINE_FILE"
-    {
-        echo "source=current_runtime"
-        echo "captured_at=$(date '+%Y-%m-%d %H:%M:%S')"
-        echo "snapshot=none"
-    } > "$PROVIDER_BASELINE_META"
-    : > "$PROVIDER_BASELINE_SOURCEMAP"
-    while IFS= read -r key; do
-        [[ -z "$key" ]] && continue
-        local v
-        v=$(provider_tuning_kv_read "$key" "$PROVIDER_BASELINE_FILE")
-        echo "${key}|runtime|${v}" >> "$PROVIDER_BASELINE_SOURCEMAP"
-    done < <(provider_tuning_keys)
-    detect_provider_tuning_params
-}
-
-restore_provider_tuning_baseline() {
-    log_section "按服务商基线恢复 sysctl 参数"
-    ensure_provider_baseline
-    create_config_snapshot "before_restore_provider_baseline"
-
-    {
-        echo "# Generated by AegisTune baseline restore"
-        echo "# generated_at=$(date '+%Y-%m-%d %H:%M:%S')"
-        while IFS= read -r key; do
-            [[ -z "$key" ]] && continue
-            local value
-            value=$(provider_tuning_kv_read "$key" "$PROVIDER_BASELINE_FILE")
-            case "$value" in
-                ""|__unknown__|__unsupported__|__not_set_in_snapshot__|__not_set_in_sysctl_files__)
-                    continue
-                    ;;
-            esac
-            echo "${key} = ${value}"
-        done < <(provider_tuning_keys)
-    } > "$PROVIDER_RESTORE_FILE"
-
-    if ! grep -qE '^[a-z0-9_.]+[[:space:]]*=' "$PROVIDER_RESTORE_FILE"; then
-        log_warn "基线中无可恢复的显式参数，已跳过应用"
-        rm -f "$PROVIDER_RESTORE_FILE"
-        return 1
-    fi
-
-    sysctl -p "$PROVIDER_RESTORE_FILE" >/dev/null 2>&1 || true
-    sysctl --system >/dev/null 2>&1 || true
-    log_success "已应用服务商基线参数: $PROVIDER_RESTORE_FILE"
-    verify_installation
-}
 
 create_config_snapshot() {
     local reason="$1"
-    ensure_provider_baseline
     local ts
     ts=$(date +%Y%m%d-%H%M%S)
     local snap_dir="${SNAPSHOT_ROOT}/snapshot-${ts}"
@@ -3732,16 +2699,12 @@ create_config_snapshot() {
         fi
     done < <(snapshot_tracked_files)
 
-    local bpftune_running="no"
-    is_bpftune_running && bpftune_running="yes"
     {
         echo "created_at=$(date '+%Y-%m-%d %H:%M:%S')"
         echo "reason=${reason:-manual}"
         echo "kernel=$(uname -r)"
         echo "cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
         echo "qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
-        echo "bpftune_installed=$([[ -n "$(command -v bpftune 2>/dev/null)" ]] && echo yes || echo no)"
-        echo "bpftune_running=${bpftune_running}"
     } > "${snap_dir}/meta.env"
 
     log_success "快照已创建: ${snap_dir}"
@@ -3955,18 +2918,7 @@ print_system_status_card() {
     render_status_card_line "IPv6本机:      " "$ipv6_local_cell"
     echo -e "${CYAN}├──────────────────────────────────────────────────┤${NC}"
 
-    local bpftune_cell tcp_buffer_cell brutal_cell nginx_cell
-    if is_bpftune_installed; then
-        if is_bpftune_running; then
-            bpftune_cell="${GREEN}运行中 ✓${NC}"
-        else
-            bpftune_cell="${YELLOW}已安装${NC}"
-        fi
-    else
-        bpftune_cell="${YELLOW}未安装${NC}"
-    fi
-    render_status_card_line "bpftune:       " "$bpftune_cell"
-
+    local tcp_buffer_cell
     local rmem_max
     rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "")
     if [[ -n "$rmem_max" && "$rmem_max" =~ ^[0-9]+$ ]]; then
@@ -3977,23 +2929,6 @@ print_system_status_card() {
         tcp_buffer_cell="${YELLOW}未知${NC}"
     fi
     render_status_card_line "TCP 缓冲区:    " "$tcp_buffer_cell"
-
-    if is_tcp_brutal_loaded; then
-        brutal_cell="${GREEN}已加载${NC}"
-    elif is_tcp_brutal_installed; then
-        brutal_cell="${YELLOW}已安装${NC}"
-    else
-        brutal_cell="${YELLOW}未安装${NC}"
-    fi
-    render_status_card_line "TCP Brutal:    " "$brutal_cell"
-
-    if is_brutal_nginx_installed; then
-        nginx_cell="${GREEN}已安装${NC}"
-    else
-        nginx_cell="${YELLOW}未安装${NC}"
-    fi
-    render_status_card_line "brutal-nginx:  " "$nginx_cell"
-
     echo -e "${CYAN}└──────────────────────────────────────────────────┘${NC}"
 }
 
@@ -4012,12 +2947,6 @@ verify_installation() {
 }
 
 show_final_message() {
-    local bpftune_status=""
-    if command -v bpftune &> /dev/null && is_bpftune_running; then
-        bpftune_status="bpftune 自动调优已启用"
-    else
-        bpftune_status="使用静态缓冲区配置"
-    fi
     
     echo -e "${GREEN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
@@ -4025,18 +2954,12 @@ show_final_message() {
     echo "╠══════════════════════════════════════════════════════════════╣"
     echo "║                                                              ║"
     echo "║  🚀 已配置: BBR + ${QDISC_CHOICE^^}                                        ║"
-    echo "║  🔧 $bpftune_status                              ║"
     echo "║                                                              ║"
     echo "╠══════════════════════════════════════════════════════════════╣"
     echo "║  配置文件:                                                   ║"
     echo "║    • /etc/sysctl.d/99-bbr-tuning.conf                       ║"
     echo "║    • /etc/modules-load.d/network-tuning.conf                ║"
     echo "║                                                              ║"
-    if command -v bpftune &> /dev/null; then
-    echo "║  查看 bpftune 调优日志:                                      ║"
-    echo "║    journalctl -u bpftune -f                                 ║"
-    echo "║                                                              ║"
-    fi
     echo "║  卸载命令:                                                   ║"
     echo "║    sudo bash $0 uninstall                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
@@ -4050,7 +2973,6 @@ uninstall() {
 
     create_config_snapshot "before_uninstall_network_tuning"
     detect_pkg_manager
-    remove_bpftune
     
     # 删除配置文件
     rm -f /etc/sysctl.d/99-bbr-tuning.conf
@@ -4065,252 +2987,6 @@ uninstall() {
     
     log_success "配置已删除"
     log_info "注意: BBR 和队列调度将在重启后恢复默认值"
-}
-
-write_corona_profile_sysctl() {
-    local profile="$1"
-    case "$profile" in
-        dmit)
-            cat > /etc/sysctl.conf <<'DMIT_CORONA_EOF'
-net.core.default_qdisc = fq
-net.core.rmem_max = 67108848
-net.core.wmem_max = 67108848
-net.core.somaxconn = 4096
-net.ipv4.tcp_max_syn_backlog = 4096
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_rmem = 16384 16777216 536870912
-net.ipv4.tcp_wmem = 16384 16777216 536870912
-net.ipv4.tcp_adv_win_scale = -2
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-kernel.panic = -1
-vm.swappiness = 0
-DMIT_CORONA_EOF
-            ;;
-        an4)
-            cat > /etc/sysctl.conf <<'AN4_CORONA_EOF'
-# === LAX.AN4.EB.CORONA (1G内存 + 2Gbps口) ===
-# 基于 BDP 目标约 37.5MB，缓冲区锁定 40MB
-
-# 1. 拥塞控制 (Kernel 6.x BBR)
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# 2. 流量队列
-net.core.somaxconn = 1024
-net.ipv4.tcp_max_syn_backlog = 1024
-net.core.netdev_max_backlog = 2048
-
-# 3. 核心缓冲区：锁定 40MB
-net.core.rmem_max = 41943040
-net.core.wmem_max = 41943040
-net.ipv4.tcp_rmem = 16384 16777216 41943040
-net.ipv4.tcp_wmem = 16384 16777216 41943040
-
-# 4. 内存压榨
-net.ipv4.tcp_adv_win_scale = 30
-
-# 5. 协议优化
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-
-# 6. 系统保命
-kernel.panic = 10
-vm.swappiness = 1
-vm.overcommit_memory = 1
-
-# === 进阶功能优化 (Optional, 默认不启用) ===
-# net.ipv4.ip_forward = 1
-# net.ipv4.tcp_fastopen = 3
-# net.ipv4.tcp_mtu_probing = 1
-# net.ipv4.tcp_keepalive_time = 600
-# net.ipv4.tcp_keepalive_intvl = 15
-# net.ipv4.tcp_keepalive_probes = 3
-# net.core.rmem_default = 8388608
-# net.core.wmem_default = 8388608
-# fs.file-max = 1000000
-AN4_CORONA_EOF
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-apply_corona_profile() {
-    local profile="${1:-}"
-    local profile_name=""
-    local snapshot_reason=""
-
-    if [[ -z "$profile" ]]; then
-        echo "请选择 Corona 参数配置:"
-        echo "1) dmit corona（默认配置, 40MB）"
-        echo "2) dmit corona（激进, 67MB）"
-        echo "0) 返回上层菜单"
-        read -p "请输入选择 [1/2/0] (默认: 1): " corona_choice
-        corona_choice=${corona_choice:-1}
-        case "$corona_choice" in
-            1) profile="an4" ;;
-            2) profile="dmit" ;;
-            0)
-                log_info "已取消 Corona 参数应用，返回上层菜单"
-                return 0
-                ;;
-            *)
-                log_error "无效选择"
-                return 1
-                ;;
-        esac
-    fi
-
-    case "$profile" in
-        dmit|dmit-corona|corona-dmit)
-            profile="dmit"
-            profile_name="DMIT.CORONA.AGGRESSIVE"
-            snapshot_reason="before_dmit_corona_profile"
-            ;;
-        an4|an4-corona|lax-an4-eb-corona|corona-an4)
-            profile="an4"
-            profile_name="DMIT.CORONA.DEFAULT"
-            snapshot_reason="before_lax_an4_eb_corona_profile"
-            ;;
-        *)
-            log_error "未知 Corona 配置: $profile"
-            return 1
-            ;;
-    esac
-
-    log_section "应用 ${profile_name} 专用参数"
-    create_config_snapshot "$snapshot_reason"
-
-    local backup_file="/etc/sysctl.conf.backup.corona.${profile}.$(date +%Y%m%d%H%M%S)"
-    if [[ -f /etc/sysctl.conf ]]; then
-        cp /etc/sysctl.conf "$backup_file"
-        log_info "已备份 /etc/sysctl.conf -> $backup_file"
-    fi
-
-    if ! write_corona_profile_sysctl "$profile"; then
-        log_error "写入 ${profile_name} 参数失败"
-        return 1
-    fi
-
-    sysctl -p
-    sysctl --system
-
-    log_success "${profile_name} 参数已应用"
-    verify_installation
-}
-
-# ============ Serverspan 自动调优 ============
-
-map_serverspan_os() {
-    case "$OS_TYPE" in
-        ubuntu|debian|linuxmint|pop|kali)
-            echo "deb"
-            ;;
-        rocky|almalinux|centos|rhel|fedora|ol|oraclelinux)
-            echo "rhel"
-            ;;
-        alpine)
-            log_warn "Serverspan API 仅支持 deb/rhel，Alpine 将按 deb 传参" >&2
-            echo "deb"
-            ;;
-        *)
-            log_warn "未知发行版 ${OS_TYPE}，默认按 deb 传参" >&2
-            echo "deb"
-            ;;
-    esac
-}
-
-detect_serverspan_cores() {
-    local cores=""
-    if command -v lscpu >/dev/null 2>&1; then
-        cores=$(LC_ALL=C lscpu -p=CORE 2>/dev/null | grep -Ev '^#' | sort -u | wc -l | awk '{print $1}')
-    fi
-    if [[ -z "$cores" || ! "$cores" =~ ^[0-9]+$ || "$cores" -le 0 ]]; then
-        cores=$(nproc 2>/dev/null || echo 1)
-    fi
-    echo "$cores"
-}
-
-detect_serverspan_threads() {
-    local threads
-    threads=$(nproc --all 2>/dev/null || nproc 2>/dev/null || echo 1)
-    [[ "$threads" =~ ^[0-9]+$ ]] || threads=1
-    (( threads > 0 )) || threads=1
-    echo "$threads"
-}
-
-detect_serverspan_ram_gb() {
-    local ram_gb
-    ram_gb=$(awk '/MemTotal/ {v=$2/1024/1024; if (v < 1) v = 1; printf "%.0f\n", v + 0.5}' /proc/meminfo 2>/dev/null)
-    [[ "$ram_gb" =~ ^[0-9]+$ ]] || ram_gb=1
-    (( ram_gb > 0 )) || ram_gb=1
-    echo "$ram_gb"
-}
-
-detect_serverspan_nic_speed() {
-    local iface speed
-    iface=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')
-    if [[ -z "$iface" ]]; then
-        iface=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev '^(lo|docker|veth|br-|virbr|tun|tap|wg|tailscale)' | head -1)
-    fi
-
-    if [[ -n "$iface" && -r "/sys/class/net/${iface}/speed" ]]; then
-        speed=$(cat "/sys/class/net/${iface}/speed" 2>/dev/null || true)
-    fi
-    if [[ -z "$speed" || ! "$speed" =~ ^[0-9]+$ || "$speed" -le 0 ]] && command -v ethtool >/dev/null 2>&1 && [[ -n "$iface" ]]; then
-        speed=$(ethtool "$iface" 2>/dev/null | awk -F': ' '/Speed:/ {gsub(/Mb\/s/,"",$2); print $2; exit}')
-    fi
-    [[ "$speed" =~ ^[0-9]+$ ]] || speed=1000
-    (( speed > 0 )) || speed=1000
-    echo "$speed"
-}
-
-detect_serverspan_disk_type() {
-    local source disk rotational
-    source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
-    disk=""
-
-    if [[ "$source" =~ ^/dev/ ]]; then
-        disk=$(lsblk -no pkname "$source" 2>/dev/null | head -1)
-        if [[ -z "$disk" ]]; then
-            disk=$(basename "$source")
-            if [[ "$disk" =~ ^(nvme[0-9]+n[0-9]+)p[0-9]+$ ]]; then
-                disk="${BASH_REMATCH[1]}"
-            elif [[ "$disk" =~ ^(mmcblk[0-9]+)p[0-9]+$ ]]; then
-                disk="${BASH_REMATCH[1]}"
-            else
-                disk=$(echo "$disk" | sed -E 's/p?[0-9]+$//')
-            fi
-        fi
-    fi
-
-    if [[ "$disk" =~ ^nvme ]]; then
-        echo "nvme"
-        return 0
-    fi
-
-    if [[ -n "$disk" && -r "/sys/block/${disk}/queue/rotational" ]]; then
-        rotational=$(cat "/sys/block/${disk}/queue/rotational" 2>/dev/null || echo "")
-        if [[ "$rotational" == "1" ]]; then
-            echo "hdd"
-            return 0
-        fi
-    fi
-
-    echo "ssd"
-}
-
-detect_serverspan_disk_size_gb() {
-    local size_gb
-    size_gb=$(df -BG / 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$2); print $2}')
-    [[ "$size_gb" =~ ^[0-9]+$ ]] || size_gb=20
-    (( size_gb > 0 )) || size_gb=20
-    echo "$size_gb"
 }
 
 system_has_ipv6() {
@@ -4538,1785 +3214,22 @@ get_ipv6_forwarding_status() {
     fi
 }
 
-is_valid_serverspan_use_case() {
-    case "$1" in
-        general|virtualization|web|database|cache|compute|fileserver|network|container|development|security|realtime|media|mail|game|blockchain|api)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-bool_to_json() {
-    [[ "$1" == "1" ]] && echo "true" || echo "false"
-}
-
-extract_serverspan_error_message() {
-    local json_file="$1"
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$json_file" <<'PY'
-import json
-import sys
-try:
-    with open(sys.argv[1], 'r', encoding='utf-8') as f:
-        data = json.load(f)
-except Exception:
-    print("无法解析 API 响应")
-    sys.exit(0)
-if isinstance(data, dict):
-    if "error" in data:
-        print(str(data["error"]))
-    elif data.get("success") is False:
-        print("API 返回 success=false")
-    else:
-        print("API 返回异常结构")
-else:
-    print("API 返回非 JSON 对象")
-PY
-        return 0
-    fi
-    grep -oE '"error"[[:space:]]*:[[:space:]]*"[^"]+"' "$json_file" 2>/dev/null | sed -E 's/^"error"[[:space:]]*:[[:space:]]*"//; s/"$//' || true
-}
-
-render_serverspan_sysctl_from_json() {
-    local json_file="$1"
-    local output_file="$2"
-
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$json_file" "$output_file" <<'PY'
-import json
-import sys
-
-json_path, output_path = sys.argv[1], sys.argv[2]
-with open(json_path, 'r', encoding='utf-8') as f:
-    data = json.load(f)
-
-if not isinstance(data, dict) or data.get("success") is not True:
-    raise SystemExit(2)
-
-config = data.get("config")
-if not isinstance(config, dict):
-    raise SystemExit(3)
-
-with open(output_path, 'w', encoding='utf-8') as out:
-    out.write("# Generated by AegisTune via Serverspan API\n")
-    comments = config.get("comments", [])
-    if isinstance(comments, list):
-        for line in comments:
-            out.write("# " + str(line) + "\n")
-    for k, v in config.items():
-        if k == "comments":
-            continue
-        if isinstance(v, bool):
-            value = "1" if v else "0"
-        elif isinstance(v, list):
-            value = " ".join(str(item) for item in v)
-        else:
-            value = str(v)
-        out.write(f"{k} = {value}\n")
-PY
-        return $?
-    fi
-
-    if command -v jq >/dev/null 2>&1; then
-        if ! jq -e '.success == true and (.config | type == "object")' "$json_file" >/dev/null 2>&1; then
-            return 2
-        fi
-        {
-            echo "# Generated by AegisTune via Serverspan API"
-            jq -r '.config.comments[]? | "# " + tostring' "$json_file"
-            jq -r '.config
-                | to_entries[]
-                | select(.key != "comments")
-                | "\(.key) = \(
-                    if (.value|type) == "array" then (.value|map(tostring)|join(" "))
-                    elif (.value|type) == "boolean" then (if .value then "1" else "0" end)
-                    else (.value|tostring)
-                    end
-                  )"' "$json_file"
-        } > "$output_file"
-        return 0
-    fi
-
-    log_error "缺少 JSON 解析器：请安装 python3 或 jq"
-    return 1
-}
-
-request_serverspan_api() {
-    local payload="$1"
-    local response_file="$2"
-    local quiet="${3:-0}"
-    local attempt=1
-
-    SERVERSPAN_LAST_API_HTTP_CODE="000"
-    while (( attempt <= 2 )); do
-        local http_code
-        if ! http_code=$(curl -sS -L -m 30 -H "Content-Type: application/json" -X POST -d "$payload" -o "$response_file" -w "%{http_code}" "$SERVERSPAN_API_URL"); then
-            SERVERSPAN_LAST_API_HTTP_CODE="000"
-            [[ "$quiet" == "1" ]] || log_error "Serverspan API 请求失败（网络错误）"
-            return 1
-        fi
-        SERVERSPAN_LAST_API_HTTP_CODE="$http_code"
-
-        if [[ "$http_code" == "200" ]]; then
-            return 0
-        fi
-
-        if [[ "$http_code" == "404" ]]; then
-            return 2
-        fi
-
-        if [[ "$http_code" == "429" && "$attempt" -eq 1 ]]; then
-            local retry_after
-            retry_after=$(grep -oE '"retry_after"[[:space:]]*:[[:space:]]*[0-9]+' "$response_file" 2>/dev/null | grep -oE '[0-9]+' | head -1)
-            [[ "$retry_after" =~ ^[0-9]+$ ]] || retry_after=20
-            [[ "$quiet" == "1" ]] || log_warn "Serverspan API 触发限流，${retry_after}s 后重试一次"
-            sleep "$retry_after"
-            attempt=$((attempt + 1))
-            continue
-        fi
-
-        [[ "$quiet" == "1" ]] || log_error "Serverspan API 返回 HTTP ${http_code}"
-        local err_msg
-        err_msg=$(extract_serverspan_error_message "$response_file")
-        [[ -n "$err_msg" && "$quiet" != "1" ]] && log_error "API 错误: ${err_msg}"
-        return 1
-    done
-
-    return 1
-}
-
-extract_sysctl_from_serverspan_html() {
-    local html_file="$1"
-    local output_file="$2"
-
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$html_file" "$output_file" <<'PY'
-import html
-import re
-import sys
-
-html_path, out_path = sys.argv[1], sys.argv[2]
-content = open(html_path, 'r', encoding='utf-8', errors='ignore').read()
-m = re.search(r'<pre id=sysctlOut[^>]*>(.*?)</pre>', content, flags=re.S | re.I)
-if not m:
-    raise SystemExit(2)
-text = html.unescape(m.group(1)).strip()
-if "Generate a configuration to see output here" in text:
-    raise SystemExit(3)
-open(out_path, 'w', encoding='utf-8').write(text + "\n")
-PY
-        return $?
-    fi
-
-    awk '
-    BEGIN { in_pre=0 }
-    /<pre id=sysctlOut/ {
-        in_pre=1
-        sub(/.*<pre id=sysctlOut[^>]*>/, "", $0)
-    }
-    in_pre {
-        line=$0
-        if (line ~ /<\/pre>/) {
-            sub(/<\/pre>.*/, "", line)
-            print line
-            exit
-        }
-        print line
-    }' "$html_file" > "$output_file"
-
-    if grep -q "Generate a configuration to see output here" "$output_file"; then
-        return 3
-    fi
-    if [[ ! -s "$output_file" ]]; then
-        return 2
-    fi
-    return 0
-}
-
-request_serverspan_web_generator() {
-    local os="$1"
-    local cores="$2"
-    local threads="$3"
-    local ram="$4"
-    local nic="$5"
-    local disk_type="$6"
-    local use_case="$7"
-    local disable_ipv6="$8"
-    local disable_ipv4="$9"
-    local enable_forwarding="${10}"
-    local output_file="${11}"
-
-    local html_tmp
-    html_tmp=$(mktemp)
-
-    SERVERSPAN_LAST_WEB_HTTP_CODE="000"
-    local http_code
-    if ! http_code=$(curl -sS -m 30 -X POST \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        --data "os=${os}&cores=${cores}&threads=${threads}&ram=${ram}&nic=${nic}&disk_type=${disk_type}&use_case=${use_case}&tuning_mode=moderate&disable_ipv6=${disable_ipv6}&disable_ipv4=${disable_ipv4}&enable_forwarding=${enable_forwarding}" \
-        -o "$html_tmp" -w "%{http_code}" "$SERVERSPAN_WEB_URL"); then
-        rm -f "$html_tmp"
-        SERVERSPAN_LAST_WEB_HTTP_CODE="000"
-        return 1
-    fi
-    SERVERSPAN_LAST_WEB_HTTP_CODE="$http_code"
-    if [[ "$http_code" != "200" ]]; then
-        rm -f "$html_tmp"
-        return 1
-    fi
-
-    if ! extract_sysctl_from_serverspan_html "$html_tmp" "$output_file"; then
-        rm -f "$html_tmp"
-        return 1
-    fi
-
-    rm -f "$html_tmp"
-    return 0
-}
-
-calc_fallback_buffer_max_bytes() {
-    local ram_gb="$1"
-    if (( ram_gb <= 1 )); then
-        echo 41943040
-    elif (( ram_gb <= 2 )); then
-        echo 67108864
-    elif (( ram_gb <= 4 )); then
-        echo 100663296
-    elif (( ram_gb <= 8 )); then
-        echo 134217728
-    elif (( ram_gb <= 16 )); then
-        echo 268435456
-    else
-        echo 536870912
-    fi
-}
-
-format_mib_from_bytes() {
-    local value="$1"
-    awk -v v="$value" 'BEGIN {printf "%.1f", v/1024/1024}'
-}
-
-read_sysctl_value_from_file() {
-    local file="$1"
-    local key="$2"
-    [[ -f "$file" ]] || return 1
-    awk -F= -v key="$key" '
-        $0 !~ /^[[:space:]]*#/ {
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
-            if ($1 == key) {
-                value=$2
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-                result=value
-            }
-        }
-        END {
-            if (result != "") print result
-        }
-    ' "$file"
-}
-
-provider_baseline_value_is_explicit() {
-    local value="$1"
-    case "$value" in
-        ""|__unknown__|__unsupported__|__not_set_in_snapshot__|__not_set_in_sysctl_files__)
-            return 1
-            ;;
-        *)
-            return 0
-            ;;
-    esac
-}
-
-provider_baseline_source_for_key() {
-    local key="$1"
-    [[ -f "$PROVIDER_BASELINE_SOURCEMAP" ]] || return 1
-    awk -F'|' -v key="$key" '$1 == key {print $2}' "$PROVIDER_BASELINE_SOURCEMAP" 2>/dev/null | tail -1
-}
-
-render_provider_baseline_source_label() {
-    local source_file="$1"
-    case "$source_file" in
-        ""|runtime)
-            echo "原厂/服务商基线(runtime)"
-            ;;
-        __kernel_default__)
-            echo "原厂/服务商基线(kernel-default)"
-            ;;
-        *)
-            echo "原厂/服务商基线($(basename "$source_file"))"
-            ;;
-    esac
-}
-
-is_unified_auto_buffer_key() {
-    case "$1" in
-        net.core.rmem_max|net.core.wmem_max|net.core.rmem_default|net.core.wmem_default|net.ipv4.tcp_rmem|net.ipv4.tcp_wmem)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-is_unified_auto_template_priority_key() {
-    case "$1" in
-        net.core.default_qdisc|net.ipv4.tcp_congestion_control|net.core.somaxconn|net.ipv4.tcp_max_syn_backlog|net.core.netdev_max_backlog)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-is_unified_auto_baseline_priority_key() {
-    case "$1" in
-        net.ipv4.tcp_adv_win_scale|net.ipv4.tcp_sack|net.ipv4.tcp_timestamps|net.ipv4.tcp_window_scaling|\
-        net.ipv4.tcp_tw_reuse|net.ipv4.tcp_fin_timeout|net.ipv4.tcp_fastopen|net.ipv4.tcp_mtu_probing|\
-        net.ipv4.tcp_keepalive_time|net.ipv4.tcp_keepalive_intvl|net.ipv4.tcp_keepalive_probes|\
-        fs.file-max|kernel.panic|vm.swappiness|vm.overcommit_memory)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-remove_sysctl_keys_from_file() {
-    local file="$1"
-    shift
-    [[ -f "$file" ]] || return 1
-    [[ $# -gt 0 ]] || return 0
-
-    local sed_args=()
-    local key
-    for key in "$@"; do
-        sed_args+=(-e "/^[[:space:]]*${key//./\\.}[[:space:]]*=.*/d")
-    done
-    sed -i -E "${sed_args[@]}" "$file"
-}
-
-calc_auto_buffer_floor_bytes() {
-    local use_case="$1"
-    local ram_gb="$2"
-    local floor_bytes
-
-    case "$use_case" in
-        network|api|fileserver|media|mail|game|blockchain|web)
-            if (( ram_gb <= 1 )); then
-                floor_bytes=41943040
-            elif (( ram_gb <= 2 )); then
-                floor_bytes=41943040
-            elif (( ram_gb <= 4 )); then
-                floor_bytes=67108864
-            elif (( ram_gb <= 8 )); then
-                floor_bytes=100663296
-            elif (( ram_gb <= 16 )); then
-                floor_bytes=134217728
-            else
-                floor_bytes=268435456
-            fi
-            ;;
-        *)
-            if (( ram_gb <= 1 )); then
-                floor_bytes=16777216
-            elif (( ram_gb <= 2 )); then
-                floor_bytes=33554432
-            elif (( ram_gb <= 4 )); then
-                floor_bytes=50331648
-            elif (( ram_gb <= 16 )); then
-                floor_bytes=67108864
-            else
-                floor_bytes=134217728
-            fi
-            ;;
-    esac
-
-    echo "$floor_bytes"
-}
-
-apply_auto_tcp_buffer_floor_if_needed() {
-    local file="$1"
-    local use_case="$2"
-    local ram_gb="$3"
-    local source_label="$4"
-    local current_max target_max mid_buf def_buf
-
-    AUTO_BUFFER_FLOOR_APPLIED=0
-    AUTO_BUFFER_FLOOR_SOURCE=""
-    AUTO_BUFFER_ORIGINAL_MAX=""
-    AUTO_BUFFER_TARGET_MAX=""
-
-    current_max=$(read_sysctl_value_from_file "$file" "net.core.rmem_max" 2>/dev/null || true)
-    [[ "$current_max" =~ ^[0-9]+$ ]] || return 1
-
-    target_max=$(calc_auto_buffer_floor_bytes "$use_case" "$ram_gb")
-    [[ "$target_max" =~ ^[0-9]+$ ]] || return 1
-
-    if (( current_max >= target_max )); then
-        return 1
-    fi
-
-    mid_buf=$((target_max / 4))
-    (( mid_buf < 1048576 )) && mid_buf=1048576
-    def_buf=$((target_max / 8))
-    (( def_buf < 1048576 )) && def_buf=1048576
-    (( def_buf > 16777216 )) && def_buf=16777216
-
-    sed -i -E \
-        -e '/^net\.core\.rmem_max[[:space:]]*=.*/d' \
-        -e '/^net\.core\.wmem_max[[:space:]]*=.*/d' \
-        -e '/^net\.core\.rmem_default[[:space:]]*=.*/d' \
-        -e '/^net\.core\.wmem_default[[:space:]]*=.*/d' \
-        -e '/^net\.ipv4\.tcp_rmem[[:space:]]*=.*/d' \
-        -e '/^net\.ipv4\.tcp_wmem[[:space:]]*=.*/d' \
-        "$file"
-
-    cat >> "$file" <<EOF
-# AegisTune adjusted TCP buffer floor
-# source=${source_label}, use_case=${use_case}, ram=${ram_gb}GB
-# original net.core.rmem_max = ${current_max}
-net.core.rmem_max = ${target_max}
-net.core.wmem_max = ${target_max}
-net.core.rmem_default = ${def_buf}
-net.core.wmem_default = ${def_buf}
-net.ipv4.tcp_rmem = 16384 ${mid_buf} ${target_max}
-net.ipv4.tcp_wmem = 16384 ${mid_buf} ${target_max}
-EOF
-
-    AUTO_BUFFER_FLOOR_APPLIED=1
-    AUTO_BUFFER_FLOOR_SOURCE="$source_label"
-    AUTO_BUFFER_ORIGINAL_MAX="$current_max"
-    AUTO_BUFFER_TARGET_MAX="$target_max"
-    return 0
-}
-
-write_local_detected_fallback_sysctl() {
-    local output_file="$1"
-    local use_case="$2"
-    local cores="$3"
-    local threads="$4"
-    local ram_gb="$5"
-    local nic="$6"
-    local disk_type="$7"
-    local disk_size_gb="$8"
-
-    local max_buf mid_buf def_buf
-    max_buf=$(calc_fallback_buffer_max_bytes "$ram_gb")
-    mid_buf=$((max_buf / 4))
-    (( mid_buf < 1048576 )) && mid_buf=1048576
-    def_buf=$((max_buf / 8))
-    (( def_buf < 1048576 )) && def_buf=1048576
-    (( def_buf > 16777216 )) && def_buf=16777216
-
-    local somaxconn syn_backlog netdev_backlog
-    somaxconn=$((1024 + threads * 256))
-    (( somaxconn < 1024 )) && somaxconn=1024
-    (( somaxconn > 16384 )) && somaxconn=16384
-    if [[ "$use_case" == "web" || "$use_case" == "api" || "$use_case" == "network" ]]; then
-        somaxconn=$((somaxconn * 2))
-        (( somaxconn > 32768 )) && somaxconn=32768
-    fi
-    syn_backlog=$((somaxconn * 2))
-    (( syn_backlog > 65535 )) && syn_backlog=65535
-    netdev_backlog=$((somaxconn * 4))
-    (( netdev_backlog > 65535 )) && netdev_backlog=65535
-
-    local swappiness dirty_ratio dirty_bg_ratio writeback_cs
-    swappiness=10
-    dirty_ratio=15
-    dirty_bg_ratio=5
-    writeback_cs=1500
-    if [[ "$disk_type" == "hdd" ]]; then
-        writeback_cs=3000
-    fi
-    if (( disk_size_gb <= 20 )); then
-        dirty_ratio=10
-        dirty_bg_ratio=3
-    fi
-    if [[ "$use_case" == "database" ]]; then
-        swappiness=5
-        dirty_ratio=10
-        dirty_bg_ratio=3
-    fi
-
-    cat > "$output_file" <<EOF
-# Generated by AegisTune local hardware fallback
-# reason: Serverspan API/Web generator unavailable
-# profile: ${use_case} (moderate), hardware=${cores}c/${threads}t ${ram_gb}GB RAM ${nic}Mb/s ${disk_type} ${disk_size_gb}GB
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.somaxconn = ${somaxconn}
-net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
-net.core.netdev_max_backlog = ${netdev_backlog}
-net.core.rmem_max = ${max_buf}
-net.core.wmem_max = ${max_buf}
-net.core.rmem_default = ${def_buf}
-net.core.wmem_default = ${def_buf}
-net.ipv4.tcp_rmem = 16384 ${mid_buf} ${max_buf}
-net.ipv4.tcp_wmem = 16384 ${mid_buf} ${max_buf}
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 3
-vm.swappiness = ${swappiness}
-vm.dirty_ratio = ${dirty_ratio}
-vm.dirty_background_ratio = ${dirty_bg_ratio}
-vm.dirty_writeback_centisecs = ${writeback_cs}
-kernel.panic = 10
-EOF
-}
-
-write_forwarding_overlay() {
-    local ipv4_forward="$1"
-    local ipv6_forward="$2"
-    local has_ipv6=0
-
-    system_has_ipv6 && has_ipv6=1
-    if [[ "$has_ipv6" != "1" ]]; then
-        ipv6_forward="0"
-    fi
-
-    if [[ "$ipv4_forward" != "1" && "$ipv6_forward" != "1" ]]; then
-        rm -f "$FORWARDING_OVERLAY_FILE"
-        log_info "未启用 IPv4/IPv6 转发（已移除转发覆盖文件，如存在）"
-        return 0
-    fi
-
-    cat > "$FORWARDING_OVERLAY_FILE" <<EOF
-# Generated by AegisTune (forwarding overlay)
-net.ipv4.ip_forward = ${ipv4_forward}
-EOF
-    if [[ "$has_ipv6" == "1" ]]; then
-        cat >> "$FORWARDING_OVERLAY_FILE" <<EOF
-net.ipv6.conf.all.forwarding = ${ipv6_forward}
-net.ipv6.conf.default.forwarding = ${ipv6_forward}
-EOF
-        log_success "已写入转发覆盖: $FORWARDING_OVERLAY_FILE (IPv4=${ipv4_forward}, IPv6=${ipv6_forward})"
-    else
-        log_success "已写入转发覆盖: $FORWARDING_OVERLAY_FILE (IPv4=${ipv4_forward})"
-        log_info "未检测到可用 IPv6，已跳过 IPv6 转发配置写入"
-    fi
-}
-
-apply_ipv4_preference_no_disable_ipv6() {
-    local skip_snapshot="${1:-0}"
-    local gai_conf="/etc/gai.conf"
-
-    log_section "设置 IPv4 优先 (不关闭 IPv6)"
-    if [[ "$skip_snapshot" != "1" ]]; then
-        create_config_snapshot "before_ipv4_prefer_no_disable_ipv6"
-    fi
-
-    [[ -f "$gai_conf" ]] || touch "$gai_conf"
-    cp "$gai_conf" "${gai_conf}.backup.$(date +%Y%m%d%H%M%S)"
-
-    sed -i '/^[[:space:]]*precedence[[:space:]]*::ffff:0:0\/96[[:space:]]*/d' "$gai_conf"
-    echo "precedence ::ffff:0:0/96  100" >> "$gai_conf"
-
-    log_success "已启用 IPv4 优先地址选择（保留 IPv6 可用）"
-    log_info "配置文件: $gai_conf"
-}
-
-get_speedtest_cli_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo "x86_64" ;;
-        aarch64|arm64) echo "aarch64" ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-ensure_speedtest_cli() {
-    local arch download_url tmp_dir
-
-    if command -v speedtest >/dev/null 2>&1; then
-        return 0
-    fi
-
-    arch=$(get_speedtest_cli_arch) || {
-        log_error "当前架构 $(uname -m) 暂未支持自动安装 speedtest，请改用手动带宽输入"
-        return 1
-    }
-
-    detect_pkg_manager
-    update_pkg_cache
-    install_dependencies
-
-    download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-${arch}.tgz"
-    tmp_dir=$(mktemp -d)
-    if ! download_file "$download_url" "$tmp_dir/speedtest.tgz"; then
-        rm -rf "$tmp_dir"
-        log_error "下载 speedtest CLI 失败"
-        return 1
-    fi
-
-    if ! tar -xzf "$tmp_dir/speedtest.tgz" -C "$tmp_dir"; then
-        rm -rf "$tmp_dir"
-        log_error "解压 speedtest CLI 失败"
-        return 1
-    fi
-
-    if [[ ! -f "$tmp_dir/speedtest" ]]; then
-        rm -rf "$tmp_dir"
-        log_error "speedtest 可执行文件不存在"
-        return 1
-    fi
-
-    install -m 755 "$tmp_dir/speedtest" /usr/local/bin/speedtest
-    rm -rf "$tmp_dir"
-
-    command -v speedtest >/dev/null 2>&1
-}
-
-measure_speedtest_upload_mbps() {
-    local output upload_speed rounded
-
-    ensure_speedtest_cli || return 1
-    log_info "正在运行 speedtest 上传测速..."
-
-    output=$(speedtest --accept-license --accept-gdpr 2>&1) || true
-    upload_speed=$(printf '%s\n' "$output" | sed -nE 's/.*[Uu]pload:[[:space:]]*([0-9]+(\.[0-9]+)?).*/\1/p' | head -1)
-    [[ -n "$upload_speed" ]] || upload_speed=$(printf '%s\n' "$output" | awk '/Upload:/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {print $i; exit}}')
-
-    if [[ -z "$upload_speed" ]]; then
-        log_error "speedtest 未返回可解析的上传带宽"
-        return 1
-    fi
-
-    rounded=$(awk -v v="$upload_speed" 'BEGIN {printf "%.0f", v}')
-    [[ "$rounded" =~ ^[0-9]+$ ]] || return 1
-    (( rounded > 0 )) || return 1
-    printf '%s\n' "$rounded"
-}
-
-get_region_default_rtt_ms() {
-    local region="$1"
-    case "$region" in
-        overseas) echo 200 ;;
-        *) echo 50 ;;
-    esac
-}
-
-get_region_label() {
-    local region="$1"
-    case "$region" in
-        overseas) echo "美国/欧洲" ;;
-        *) echo "亚太地区" ;;
-    esac
-}
-
-measure_ping_rtt_ms() {
-    local target="$1"
-    local output avg
-
-    output=$(ping -c 4 -W 2 "$target" 2>/dev/null) || return 1
-    avg=$(printf '%s\n' "$output" | sed -nE 's@.*= [0-9.]+/([0-9.]+)/[0-9.]+/[0-9.]+ ms.*@\1@p' | head -1)
-    [[ -n "$avg" ]] || avg=$(printf '%s\n' "$output" | sed -nE 's@.*= [0-9.]+/([0-9.]+)/[0-9.]+ ms.*@\1@p' | head -1)
-    [[ -n "$avg" ]] || return 1
-    awk -v v="$avg" 'BEGIN {printf "%.0f\n", v}'
-}
-
-calc_smart_bdp_min_bytes() {
-    local bandwidth_mbps="$1"
-    local rtt_ms="$2"
-    local ram_gb="$3"
-    local min_bytes=8388608
-
-    if (( rtt_ms >= 120 )); then
-        min_bytes=16777216
-    elif (( rtt_ms >= 60 )); then
-        min_bytes=12582912
-    fi
-
-    if (( bandwidth_mbps >= 2000 && ram_gb >= 2 && min_bytes < 16777216 )); then
-        min_bytes=16777216
-    fi
-    if (( bandwidth_mbps >= 5000 && ram_gb >= 4 && min_bytes < 25165824 )); then
-        min_bytes=25165824
-    fi
-
-    echo "$min_bytes"
-}
-
-calc_smart_bdp_headroom_factor() {
-    local rtt_source="$1"
-    if [[ "$rtt_source" == "measured" ]]; then
-        echo "1.25"
-    else
-        echo "1.50"
-    fi
-}
-
-calc_smart_bdp_buffer_bytes() {
-    local bandwidth_mbps="$1"
-    local rtt_ms="$2"
-    local ram_gb="$3"
-    local rtt_source="$4"
-    local headroom min_bytes max_bytes buffer_bytes
-
-    headroom=$(calc_smart_bdp_headroom_factor "$rtt_source")
-    min_bytes=$(calc_smart_bdp_min_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb")
-    max_bytes=$(calc_fallback_buffer_max_bytes "$ram_gb")
-
-    buffer_bytes=$(awk -v bw="$bandwidth_mbps" -v rtt="$rtt_ms" -v factor="$headroom" '
-        BEGIN {
-            printf "%.0f", (bw * 1000000 / 8) * (rtt / 1000) * factor
-        }')
-    [[ "$buffer_bytes" =~ ^[0-9]+$ ]] || buffer_bytes="$min_bytes"
-
-    if (( buffer_bytes < min_bytes )); then
-        buffer_bytes=$min_bytes
-    fi
-    if (( buffer_bytes > max_bytes )); then
-        buffer_bytes=$max_bytes
-    fi
-
-    echo "$buffer_bytes"
-}
-
-write_smart_bdp_sysctl() {
-    local output_file="$1"
-    local bandwidth_mbps="$2"
-    local bandwidth_source="$3"
-    local rtt_ms="$4"
-    local rtt_source="$5"
-    local rtt_target="$6"
-    local buffer_bytes="$7"
-    local ram_gb="$8"
-    local threads="$9"
-    local qdisc="${10}"
-
-    local def_buf mid_buf somaxconn syn_backlog netdev_backlog swappiness
-    local headroom_factor bdp_bytes
-    def_buf=$((buffer_bytes / 8))
-    (( def_buf < 1048576 )) && def_buf=1048576
-    (( def_buf > 16777216 )) && def_buf=16777216
-    mid_buf=$((buffer_bytes / 4))
-    (( mid_buf < 1048576 )) && mid_buf=1048576
-
-    somaxconn=$((1024 + threads * 256))
-    (( somaxconn < 1024 )) && somaxconn=1024
-    (( somaxconn > 16384 )) && somaxconn=16384
-    if (( bandwidth_mbps >= 1000 )); then
-        somaxconn=$((somaxconn * 2))
-        (( somaxconn > 32768 )) && somaxconn=32768
-    fi
-    syn_backlog=$((somaxconn * 2))
-    (( syn_backlog > 65535 )) && syn_backlog=65535
-    netdev_backlog=$((somaxconn * 4))
-    (( netdev_backlog > 65535 )) && netdev_backlog=65535
-
-    if (( ram_gb <= 2 )); then
-        swappiness=20
-    elif (( ram_gb <= 4 )); then
-        swappiness=10
-    else
-        swappiness=5
-    fi
-
-    headroom_factor=$(calc_smart_bdp_headroom_factor "$rtt_source")
-    bdp_bytes=$(awk -v bw="$bandwidth_mbps" -v rtt="$rtt_ms" '
-        BEGIN {
-            printf "%.0f", (bw * 1000000 / 8) * (rtt / 1000)
-        }')
-
-    cat > "$output_file" <<EOF
-# Generated by AegisTune smart BDP tuner
-# bandwidth_source=${bandwidth_source}
-# bandwidth_mbps=${bandwidth_mbps}
-# rtt_source=${rtt_source}
-# rtt_target=${rtt_target}
-# rtt_ms=${rtt_ms}
-# bdp_bytes=${bdp_bytes}
-# headroom_factor=${headroom_factor}
-# final_buffer_bytes=${buffer_bytes}
-# ram_gb=${ram_gb}
-net.core.default_qdisc = ${qdisc}
-net.ipv4.tcp_congestion_control = bbr
-net.core.somaxconn = ${somaxconn}
-net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
-net.core.netdev_max_backlog = ${netdev_backlog}
-net.core.rmem_max = ${buffer_bytes}
-net.core.wmem_max = ${buffer_bytes}
-net.core.rmem_default = ${def_buf}
-net.core.wmem_default = ${def_buf}
-net.ipv4.tcp_rmem = 16384 ${mid_buf} ${buffer_bytes}
-net.ipv4.tcp_wmem = 16384 ${mid_buf} ${buffer_bytes}
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 3
-vm.swappiness = ${swappiness}
-kernel.panic = 10
-EOF
-}
-
-apply_smart_bdp_profile() {
-    local bandwidth_mode="${1:-manual}"
-    local rtt_mode="${2:-region}"
-    local has_ipv6=0
-    local prefer_ipv4 ipv4_forward ipv6_forward enable_forwarding=0
-    local bandwidth_mbps rtt_ms rtt_source rtt_target bandwidth_source region region_label
-    local ram_gb threads qdisc candidate_file
-
-    log_section "智能 BDP 自动调优"
-    AUTO_BUFFER_FLOOR_APPLIED=0
-    AUTO_BUFFER_FLOOR_SOURCE=""
-    AUTO_BUFFER_ORIGINAL_MAX=""
-    AUTO_BUFFER_TARGET_MAX=""
-    detect_os
-    detect_pkg_manager
-    detect_kernel
-    system_has_ipv6 && has_ipv6=1
-
-    if [[ "$bandwidth_mode" == "speedtest" ]]; then
-        bandwidth_mbps=$(measure_speedtest_upload_mbps) || {
-            log_warn "自动测速失败，切换为手动输入带宽"
-            bandwidth_mode="manual"
-        }
-        if [[ -n "$bandwidth_mbps" ]]; then
-            bandwidth_source="speedtest"
-            log_success "已检测上传带宽: ${bandwidth_mbps} Mbps"
-        fi
-    fi
-
-    if [[ "$bandwidth_mode" != "speedtest" ]]; then
-        while true; do
-            read -p "请输入上传带宽（Mbps，例如 500 / 1000 / 2000，输入 0 返回）: " bandwidth_mbps
-            if [[ "$bandwidth_mbps" == "0" ]]; then
-                log_info "已取消智能 BDP 调优，返回上层菜单"
-                return 0
-            fi
-            if [[ "$bandwidth_mbps" =~ ^[0-9]+$ ]] && (( bandwidth_mbps > 0 )); then
-                break
-            fi
-            log_error "请输入有效的正整数带宽值"
-        done
-        bandwidth_source="manual"
-    fi
-
-    if [[ "$rtt_mode" == "measured" ]]; then
-        read -p "请输入 RTT 测试目标（域名或 IP，默认 1.1.1.1）: " rtt_target
-        [[ -z "$rtt_target" ]] && rtt_target="1.1.1.1"
-        rtt_ms=$(measure_ping_rtt_ms "$rtt_target") || {
-            log_warn "RTT 实测失败，改用地区近似 RTT"
-            rtt_mode="region"
-        }
-        if [[ -n "$rtt_ms" ]]; then
-            rtt_source="measured"
-            log_success "实测 RTT: ${rtt_ms} ms (target=${rtt_target})"
-        fi
-    fi
-
-    if [[ "$rtt_mode" != "measured" ]]; then
-        while true; do
-            echo ""
-            echo "请选择主要服务地区："
-            echo "1) 亚太地区（默认 RTT 50ms）"
-            echo "2) 美国/欧洲（默认 RTT 200ms）"
-            echo "0) 返回上层菜单"
-            read -p "请输入选择 [1/2/0]: " region
-            region="${region:-1}"
-            case "$region" in
-                1)
-                    region="asia"
-                    break
-                    ;;
-                2)
-                    region="overseas"
-                    break
-                    ;;
-                0)
-                    log_info "已取消智能 BDP 调优，返回上层菜单"
-                    return 0
-                    ;;
-                *)
-                    log_error "无效选择"
-                    ;;
-            esac
-        done
-        rtt_ms=$(get_region_default_rtt_ms "$region")
-        region_label=$(get_region_label "$region")
-        rtt_source="region:${region}"
-        rtt_target="$region_label"
-        log_info "将使用地区近似 RTT: ${region_label} -> ${rtt_ms} ms"
-    fi
-
-    local ans
-    read -p "是否启用 IPv4 优先（不关闭 IPv6）? [Y/n]: " ans
-    [[ "$ans" =~ ^[Nn]$ ]] && prefer_ipv4="0" || prefer_ipv4="1"
-
-    read -p "是否开启 IPv4 转发? [y/N]: " ans
-    [[ "$ans" =~ ^[Yy]$ ]] && ipv4_forward="1" || ipv4_forward="0"
-
-    if [[ "$has_ipv6" == "1" ]]; then
-        read -p "是否开启 IPv6 转发? [y/N]: " ans
-        [[ "$ans" =~ ^[Yy]$ ]] && ipv6_forward="1" || ipv6_forward="0"
-    else
-        ipv6_forward="0"
-        log_info "未检测到可用 IPv6，已跳过 IPv6 转发提问"
-    fi
-
-    if [[ "$ipv4_forward" == "1" || "$ipv6_forward" == "1" ]]; then
-        enable_forwarding=1
-    fi
-
-    ram_gb=$(detect_serverspan_ram_gb)
-    threads=$(detect_serverspan_threads)
-    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "fq")
-    if [[ "$qdisc" != "cake" ]]; then
-        qdisc="fq"
-    fi
-
-    local buffer_bytes buffer_mib
-    buffer_bytes=$(calc_smart_bdp_buffer_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb" "$rtt_mode")
-    buffer_mib=$(format_mib_from_bytes "$buffer_bytes")
-    candidate_file=$(mktemp)
-
-    write_smart_bdp_sysctl "$candidate_file" "$bandwidth_mbps" "$bandwidth_source" "$rtt_ms" "$rtt_mode" "$rtt_target" "$buffer_bytes" "$ram_gb" "$threads" "$qdisc"
-    preview_sysctl_candidate "$candidate_file" "智能 BDP 自动调优 (${bandwidth_source} + ${rtt_source})"
-    log_info "BDP 结果: bandwidth=${bandwidth_mbps}Mbps, rtt=${rtt_ms}ms, 目标 TCP max=${buffer_mib} MiB, qdisc=${qdisc}"
-
-    read -p "是否应用以上智能 BDP 配置? [Y/n]: " ans
-    if [[ "$ans" =~ ^[Nn]$ ]]; then
-        log_info "已取消应用，候选配置未写入系统"
-        rm -f "$candidate_file"
-        return 0
-    fi
-
-    create_config_snapshot "before_smart_bdp_${bandwidth_source}_${rtt_mode}"
-    if [[ -f "$SMART_BDP_SYSCTL_FILE" ]]; then
-        cp "$SMART_BDP_SYSCTL_FILE" "${SMART_BDP_SYSCTL_FILE}.backup.$(date +%Y%m%d%H%M%S)"
-    fi
-    rm -f "$SERVERSPAN_SYSCTL_FILE"
-    cp "$candidate_file" "$SMART_BDP_SYSCTL_FILE"
-    rm -f "$candidate_file"
-    rm -f "$AUTO_MERGED_SYSCTL_FILE"
-
-    write_forwarding_overlay "$ipv4_forward" "$ipv6_forward"
-    if [[ "$prefer_ipv4" == "1" ]]; then
-        apply_ipv4_preference_no_disable_ipv6 1
-    fi
-
-    sysctl -p "$SMART_BDP_SYSCTL_FILE" >/dev/null 2>&1 || true
-    if [[ -f "$FORWARDING_OVERLAY_FILE" ]]; then
-        sysctl -p "$FORWARDING_OVERLAY_FILE" >/dev/null 2>&1 || true
-    fi
-    sysctl --system >/dev/null 2>&1 || true
-
-    log_success "智能 BDP 调优已应用: $SMART_BDP_SYSCTL_FILE"
-    log_info "生效摘要: ${bandwidth_source}/${bandwidth_mbps}Mbps + ${rtt_source}/${rtt_ms}ms => TCP max ${buffer_mib} MiB"
-    verify_installation
-}
-
-show_auto_tuning_menu() {
-    while true; do
-        clear
-        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
-        printf "%b\n" "${CYAN}║       自动调优 (统一自动挡 / Serverspan / 智能 BDP)         ║"
-        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
-        printf "%b\n" "${CYAN}║     1) 统一自动调优 (手动带宽 + 地区估算 RTT)               ║"
-        printf "%b\n" "${CYAN}║     2) 统一自动调优 (speedtest + 地区估算 RTT)              ║"
-        printf "%b\n" "${CYAN}║     3) 统一自动调优 (手动带宽 + RTT 实测)                   ║"
-        printf "%b\n" "${CYAN}║     4) 统一自动调优 (speedtest + RTT 实测)                  ║"
-        printf "%b\n" "${CYAN}║     5) 兼容模式: 仅 Serverspan 模板                         ║"
-        printf "%b\n" "${CYAN}║     6) 兼容模式: 仅智能 BDP                                 ║"
-        printf "%b\n" "${CYAN}║     7) Self-Test / Dry-Run (三条链路自检，不改系统)         ║"
-        printf "%b\n" "${CYAN}║     0) 返回主菜单                                            ║"
-        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-
-        read -p "请输入选择 [0-7]: " auto_choice
-        case "$auto_choice" in
-            1)
-                apply_unified_auto_profile manual region
-                pause_return_main_menu
-                return 0
-                ;;
-            2)
-                apply_unified_auto_profile speedtest region
-                pause_return_main_menu
-                return 0
-                ;;
-            3)
-                apply_unified_auto_profile manual measured
-                pause_return_main_menu
-                return 0
-                ;;
-            4)
-                apply_unified_auto_profile speedtest measured
-                pause_return_main_menu
-                return 0
-                ;;
-            5)
-                apply_serverspan_api_profile general 0
-                pause_return_main_menu
-                return 0
-                ;;
-            6)
-                show_smart_bdp_menu
-                pause_return_main_menu
-                return 0
-                ;;
-            7)
-                run_self_test_dry_run
-                pause_return_main_menu
-                return 0
-                ;;
-            0)
-                return 0
-                ;;
-            *)
-                log_error "无效选择"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-show_smart_bdp_menu() {
-    while true; do
-        clear
-        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
-        printf "%b\n" "${CYAN}║                 兼容模式: 智能 BDP 子菜单                   ║"
-        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
-        printf "%b\n" "${CYAN}║     1) 手动带宽 + 地区估算 RTT                               ║"
-        printf "%b\n" "${CYAN}║     2) speedtest + 地区估算 RTT                              ║"
-        printf "%b\n" "${CYAN}║     3) 手动带宽 + RTT 实测                                   ║"
-        printf "%b\n" "${CYAN}║     4) speedtest + RTT 实测                                  ║"
-        printf "%b\n" "${CYAN}║     0) 返回上层菜单                                           ║"
-        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-
-        read -p "请输入选择 [0-4]: " smart_choice
-        case "$smart_choice" in
-            1)
-                apply_smart_bdp_profile manual region
-                return 0
-                ;;
-            2)
-                apply_smart_bdp_profile speedtest region
-                return 0
-                ;;
-            3)
-                apply_smart_bdp_profile manual measured
-                return 0
-                ;;
-            4)
-                apply_smart_bdp_profile speedtest measured
-                return 0
-                ;;
-            0)
-                return 0
-                ;;
-            *)
-                log_error "无效选择"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-detect_selftest_bandwidth_mbps() {
-    local nic
-    nic=$(detect_serverspan_nic_speed 2>/dev/null || echo 0)
-    [[ "$nic" =~ ^[0-9]+$ ]] || nic=0
-
-    if (( nic <= 0 )); then
-        echo 1000
-    elif (( nic < 100 )); then
-        echo "$nic"
-    elif (( nic > 2000 )); then
-        echo 1000
-    else
-        echo "$nic"
-    fi
-}
-
-detect_selftest_rtt_ms() {
-    local target="${1:-1.1.1.1}"
-    local rtt
-
-    rtt=$(measure_ping_rtt_ms "$target" 2>/dev/null || true)
-    if [[ "$rtt" =~ ^[0-9]+$ ]] && (( rtt > 0 )); then
-        SELFTEST_RTT_SOURCE="measured"
-        SELFTEST_RTT_TARGET="$target"
-        echo "$rtt"
-    else
-        SELFTEST_RTT_SOURCE="fallback-region"
-        SELFTEST_RTT_TARGET="亚太地区"
-        echo 50
-    fi
-}
-
-preview_sysctl_candidate() {
-    local candidate_file="$1"
-    local source_label="$2"
-    local total_lines=0
-
-    [[ -f "$candidate_file" ]] || return 1
-
-    log_section "自动检测配置预览"
-    log_info "来源: ${source_label}"
-    if [[ "$AUTO_BUFFER_FLOOR_APPLIED" == "1" && "$AUTO_BUFFER_ORIGINAL_MAX" =~ ^[0-9]+$ && "$AUTO_BUFFER_TARGET_MAX" =~ ^[0-9]+$ ]]; then
-        log_warn "AegisTune 已修正过保守的 TCP 缓冲: $(format_mib_from_bytes "$AUTO_BUFFER_ORIGINAL_MAX") MiB -> $(format_mib_from_bytes "$AUTO_BUFFER_TARGET_MAX") MiB"
-    fi
-    total_lines=$(wc -l < "$candidate_file" 2>/dev/null || echo 0)
-    sed -n '1,28p' "$candidate_file"
-    if (( total_lines > 28 )); then
-        echo "... (共 ${total_lines} 行，已截取前 28 行预览)"
-    fi
-    if [[ "$AUTO_BUFFER_FLOOR_APPLIED" == "1" ]]; then
-        echo ""
-        echo "# --- AegisTune TCP buffer override ---"
-        tail -n 9 "$candidate_file"
-    fi
-    log_info "确认应用后将自动创建快照，可从主菜单 4 回滚。"
-}
-
-build_serverspan_candidate_file() {
-    local use_case="$1"
-    local candidate_file="$2"
-    local apply_tcp_floor="${3:-1}"
-
-    local api_os cores threads ram nic disk_type disk_size_gb
-    local response_file payload api_status=0 enable_forwarding=0
-
-    api_os=$(map_serverspan_os)
-    cores=$(detect_serverspan_cores)
-    threads=$(detect_serverspan_threads)
-    ram=$(detect_serverspan_ram_gb)
-    nic=$(detect_serverspan_nic_speed)
-    disk_type=$(detect_serverspan_disk_type)
-    disk_size_gb=$(detect_serverspan_disk_size_gb)
-
-    SERVERSPAN_BUILD_SOURCE=""
-    SERVERSPAN_BUILD_USED_API=0
-    SERVERSPAN_BUILD_USED_WEB=0
-    SERVERSPAN_BUILD_USED_LOCAL=0
-    SERVERSPAN_BUILD_RAM="$ram"
-    SERVERSPAN_BUILD_THREADS="$threads"
-
-    log_info "硬件识别: os=${api_os}, cores=${cores}, threads=${threads}, ram=${ram}GB, nic=${nic}Mb/s, disk=${disk_type}, disk_size=${disk_size_gb}GB, kernel=${KERNEL_VERSION}"
-    log_info "说明: 外部模板只识别系统/硬件，不识别实际 RTT、BDP、协议组合和服务商隐藏调优。"
-
-    payload=$(cat <<EOF
-{"os":"${api_os}","cores":${cores},"threads":${threads},"ram":${ram},"nic":${nic},"disk_type":"${disk_type}","use_case":"${use_case}","disable_ipv6":false,"disable_ipv4":false,"enable_forwarding":$(bool_to_json "$enable_forwarding")}
-EOF
-)
-
-    response_file=$(mktemp)
-    if request_serverspan_web_generator "$api_os" "$cores" "$threads" "$ram" "$nic" "$disk_type" "$use_case" 0 0 "$enable_forwarding" "$candidate_file"; then
-        SERVERSPAN_BUILD_USED_WEB=1
-        SERVERSPAN_BUILD_SOURCE="Serverspan 网页生成器"
-        log_success "已使用 Serverspan 网页生成器结果"
-        log_info "连通性测试(Web生成器): HTTP=${SERVERSPAN_LAST_WEB_HTTP_CODE:-000}"
-    else
-        log_warn "网页生成器不可用 (HTTP ${SERVERSPAN_LAST_WEB_HTTP_CODE:-000})，尝试旧 API 端点"
-        request_serverspan_api "$payload" "$response_file" 1 || api_status=$?
-        log_info "连通性测试(API): HTTP=${SERVERSPAN_LAST_API_HTTP_CODE}"
-
-        if [[ "$api_status" -eq 0 ]]; then
-            if render_serverspan_sysctl_from_json "$response_file" "$candidate_file"; then
-                SERVERSPAN_BUILD_USED_API=1
-                SERVERSPAN_BUILD_SOURCE="Serverspan 旧 API"
-                log_success "已使用 Serverspan 旧 API 结果"
-            else
-                local err_msg
-                err_msg=$(extract_serverspan_error_message "$response_file")
-                log_warn "Serverspan API 解析失败: ${err_msg:-unknown}"
-            fi
-        elif [[ "$api_status" -eq 2 ]]; then
-            log_warn "Serverspan 旧 API 端点当前不可用 (HTTP ${SERVERSPAN_LAST_API_HTTP_CODE})"
-        else
-            log_warn "Serverspan 旧 API 请求失败 (HTTP ${SERVERSPAN_LAST_API_HTTP_CODE:-000})"
-        fi
-
-        if [[ "$SERVERSPAN_BUILD_USED_API" -ne 1 ]]; then
-            log_warn "将使用本地硬件模板回退"
-            write_local_detected_fallback_sysctl "$candidate_file" "$use_case" "$cores" "$threads" "$ram" "$nic" "$disk_type" "$disk_size_gb"
-            SERVERSPAN_BUILD_USED_LOCAL=1
-            SERVERSPAN_BUILD_SOURCE="本地硬件模板回退"
-        fi
-    fi
-    rm -f "$response_file"
-
-    if [[ "$apply_tcp_floor" == "1" ]]; then
-        if apply_auto_tcp_buffer_floor_if_needed "$candidate_file" "$use_case" "$ram" "$SERVERSPAN_BUILD_SOURCE"; then
-            SERVERSPAN_BUILD_SOURCE="${SERVERSPAN_BUILD_SOURCE} + AegisTune TCP floor"
-            log_info "检测到 ${use_case} 模板 TCP 缓冲偏保守，已按 ${ram}GB RAM 提升到 $(format_mib_from_bytes "$AUTO_BUFFER_TARGET_MAX") MiB"
-        fi
-    fi
-
-    [[ -s "$candidate_file" ]]
-}
-
-preview_unified_auto_candidate() {
-    local candidate_file="$1"
-    local decision_file="$2"
-    local use_case="$3"
-    local template_source="$4"
-    local bandwidth_mbps="$5"
-    local bandwidth_source="$6"
-    local rtt_ms="$7"
-    local rtt_source="$8"
-    local rtt_target="$9"
-
-    local baseline_meta_source baseline_meta_time baseline_summary
-    baseline_meta_source=$(grep '^source=' "$PROVIDER_BASELINE_META" 2>/dev/null | cut -d= -f2-)
-    baseline_meta_time=$(grep '^captured_at=' "$PROVIDER_BASELINE_META" 2>/dev/null | cut -d= -f2-)
-    [[ -z "$baseline_meta_source" ]] && baseline_meta_source="unknown"
-    [[ -z "$baseline_meta_time" ]] && baseline_meta_time="unknown"
-    baseline_summary="${baseline_meta_source} @ ${baseline_meta_time}"
-
-    log_section "统一自动决策预览"
-    log_info "Use Case: ${use_case}"
-    log_info "服务商基线: ${baseline_summary}"
-    log_info "外部模板: ${template_source}"
-    log_info "Smart BDP: bandwidth=${bandwidth_mbps}Mbps (${bandwidth_source}), rtt=${rtt_ms}ms (${rtt_source}:${rtt_target})"
-    echo "参数 | 最终值 | 来源 | 基线值 | 模板值 | BDP候选"
-    echo "-----|--------|------|--------|--------|--------"
-    awk -F'|' '
-        {
-            base=$4; tpl=$5; bdp=$6
-            if (base == "" || base ~ /^__/) base="-"
-            if (tpl == "") tpl="-"
-            if (bdp == "") bdp="-"
-            printf "%s | %s | %s | %s | %s | %s\n", $1, $2, $3, base, tpl, bdp
-        }
-    ' "$decision_file"
-    echo ""
-    log_info "未出现在上表中的其余模板参数会原样保留。"
-    log_info "确认应用后将自动创建快照，可从主菜单 4 回滚。"
-    echo ""
-    sed -n '1,24p' "$candidate_file"
-}
-
-write_unified_auto_candidate() {
-    local template_file="$1"
-    local bdp_file="$2"
-    local output_file="$3"
-    local decision_file="$4"
-
-    local baseline_block template_block bdp_block
-    baseline_block=$(mktemp)
-    template_block=$(mktemp)
-    bdp_block=$(mktemp)
-
-    cp "$template_file" "$output_file"
-    remove_sysctl_keys_from_file "$output_file" $(provider_tuning_keys)
-
-    {
-        echo ""
-        echo "# AegisTune unified auto tuning merge"
-        echo "# generated_at=$(date '+%Y-%m-%d %H:%M:%S')"
-        echo "# preserved non-tracked template keys remain above"
-    } >> "$output_file"
-
-    : > "$decision_file"
-
-    local key baseline_value baseline_source_file baseline_label template_value bdp_value final_value final_source
-    while IFS= read -r key; do
-        [[ -z "$key" ]] && continue
-
-        baseline_value=$(provider_tuning_kv_read "$key" "$PROVIDER_BASELINE_FILE")
-        baseline_source_file=$(provider_baseline_source_for_key "$key" || true)
-        baseline_label=$(render_provider_baseline_source_label "$baseline_source_file")
-        template_value=$(read_sysctl_value_from_file "$template_file" "$key" 2>/dev/null || true)
-        bdp_value=""
-        is_unified_auto_buffer_key "$key" && bdp_value=$(read_sysctl_value_from_file "$bdp_file" "$key" 2>/dev/null || true)
-        final_value=""
-        final_source=""
-
-        if is_unified_auto_buffer_key "$key"; then
-            if [[ -n "$bdp_value" ]]; then
-                final_value="$bdp_value"
-                final_source="Smart BDP 修正"
-            elif [[ -n "$template_value" ]]; then
-                final_value="$template_value"
-                final_source="外部模板"
-            elif provider_baseline_value_is_explicit "$baseline_value"; then
-                final_value="$baseline_value"
-                final_source="$baseline_label"
-            fi
-        elif is_unified_auto_template_priority_key "$key"; then
-            if [[ -n "$template_value" ]]; then
-                final_value="$template_value"
-                final_source="外部模板"
-            elif provider_baseline_value_is_explicit "$baseline_value"; then
-                final_value="$baseline_value"
-                final_source="$baseline_label"
-            fi
-        elif is_unified_auto_baseline_priority_key "$key"; then
-            if provider_baseline_value_is_explicit "$baseline_value"; then
-                final_value="$baseline_value"
-                final_source="$baseline_label"
-            elif [[ -n "$template_value" ]]; then
-                final_value="$template_value"
-                final_source="外部模板"
-            fi
-        else
-            if [[ -n "$template_value" ]]; then
-                final_value="$template_value"
-                final_source="外部模板"
-            elif provider_baseline_value_is_explicit "$baseline_value"; then
-                final_value="$baseline_value"
-                final_source="$baseline_label"
-            fi
-        fi
-
-        [[ -n "$final_value" ]] || continue
-        printf '%s|%s|%s|%s|%s|%s\n' "$key" "$final_value" "$final_source" "$baseline_value" "$template_value" "$bdp_value" >> "$decision_file"
-        case "$final_source" in
-            Smart\ BDP\ 修正)
-                printf '%s = %s\n' "$key" "$final_value" >> "$bdp_block"
-                ;;
-            外部模板)
-                printf '%s = %s\n' "$key" "$final_value" >> "$template_block"
-                ;;
-            *)
-                printf '%s = %s\n' "$key" "$final_value" >> "$baseline_block"
-                ;;
-        esac
-    done < <(provider_tuning_keys)
-
-    if [[ -s "$baseline_block" ]]; then
-        {
-            echo ""
-            echo "# source: preserved provider baseline"
-            cat "$baseline_block"
-        } >> "$output_file"
-    fi
-    if [[ -s "$template_block" ]]; then
-        {
-            echo ""
-            echo "# source: external template"
-            cat "$template_block"
-        } >> "$output_file"
-    fi
-    if [[ -s "$bdp_block" ]]; then
-        {
-            echo ""
-            echo "# source: smart bdp override"
-            cat "$bdp_block"
-        } >> "$output_file"
-    fi
-
-    rm -f "$baseline_block" "$template_block" "$bdp_block"
-}
-
-apply_unified_auto_profile() {
-    local bandwidth_mode="${1:-manual}"
-    local rtt_mode="${2:-region}"
-    local default_use_case="${3:-general}"
-    local use_case="$default_use_case"
-    local has_ipv6=0
-    local prefer_ipv4 ipv4_forward ipv6_forward
-    local bandwidth_mbps rtt_ms rtt_source rtt_target bandwidth_source region region_label
-    local template_candidate bdp_candidate merged_candidate decision_file
-    local ram_gb threads qdisc buffer_bytes buffer_mib ans
-
-    log_section "统一自动调优 (基线 + 模板 + Smart BDP)"
-    AUTO_BUFFER_FLOOR_APPLIED=0
-    AUTO_BUFFER_FLOOR_SOURCE=""
-    AUTO_BUFFER_ORIGINAL_MAX=""
-    AUTO_BUFFER_TARGET_MAX=""
-
-    detect_os
-    detect_kernel
-    detect_pkg_manager
-    ensure_provider_baseline
-    system_has_ipv6 && has_ipv6=1
-
-    read -p "Use Case (默认 general，输入 0 返回): " ans
-    if [[ "$ans" == "0" ]]; then
-        log_info "已取消统一自动调优，返回上层菜单"
-        return 0
-    fi
-    use_case="${ans:-$default_use_case}"
-    if ! is_valid_serverspan_use_case "$use_case"; then
-        log_error "无效 use_case: ${use_case}"
-        log_info "可用值: general/web/database/cache/network/api 等"
-        return 1
-    fi
-
-    if [[ "$bandwidth_mode" == "speedtest" ]]; then
-        bandwidth_mbps=$(measure_speedtest_upload_mbps) || {
-            log_warn "自动测速失败，切换为手动输入带宽"
-            bandwidth_mode="manual"
-        }
-        if [[ -n "$bandwidth_mbps" ]]; then
-            bandwidth_source="speedtest"
-            log_success "已检测上传带宽: ${bandwidth_mbps} Mbps"
-        fi
-    fi
-
-    if [[ "$bandwidth_mode" != "speedtest" ]]; then
-        while true; do
-            read -p "请输入上传带宽（Mbps，例如 500 / 1000 / 2000，输入 0 返回）: " bandwidth_mbps
-            if [[ "$bandwidth_mbps" == "0" ]]; then
-                log_info "已取消统一自动调优，返回上层菜单"
-                return 0
-            fi
-            if [[ "$bandwidth_mbps" =~ ^[0-9]+$ ]] && (( bandwidth_mbps > 0 )); then
-                break
-            fi
-            log_error "请输入有效的正整数带宽值"
-        done
-        bandwidth_source="manual"
-    fi
-
-    if [[ "$rtt_mode" == "measured" ]]; then
-        read -p "请输入 RTT 测试目标（域名或 IP，默认 1.1.1.1）: " rtt_target
-        [[ -z "$rtt_target" ]] && rtt_target="1.1.1.1"
-        rtt_ms=$(measure_ping_rtt_ms "$rtt_target") || {
-            log_warn "RTT 实测失败，改用地区近似 RTT"
-            rtt_mode="region"
-        }
-        if [[ -n "$rtt_ms" ]]; then
-            rtt_source="measured"
-            log_success "实测 RTT: ${rtt_ms} ms (target=${rtt_target})"
-        fi
-    fi
-
-    if [[ "$rtt_mode" != "measured" ]]; then
-        while true; do
-            echo ""
-            echo "请选择主要服务地区："
-            echo "1) 亚太地区（默认 RTT 50ms）"
-            echo "2) 美国/欧洲（默认 RTT 200ms）"
-            echo "0) 返回上层菜单"
-            read -p "请输入选择 [1/2/0]: " region
-            region="${region:-1}"
-            case "$region" in
-                1)
-                    region="asia"
-                    break
-                    ;;
-                2)
-                    region="overseas"
-                    break
-                    ;;
-                0)
-                    log_info "已取消统一自动调优，返回上层菜单"
-                    return 0
-                    ;;
-                *)
-                    log_error "无效选择"
-                    ;;
-            esac
-        done
-        rtt_ms=$(get_region_default_rtt_ms "$region")
-        region_label=$(get_region_label "$region")
-        rtt_source="region:${region}"
-        rtt_target="$region_label"
-        log_info "将使用地区近似 RTT: ${region_label} -> ${rtt_ms} ms"
-    fi
-
-    read -p "是否启用 IPv4 优先（不关闭 IPv6）? [Y/n]: " ans
-    [[ "$ans" =~ ^[Nn]$ ]] && prefer_ipv4="0" || prefer_ipv4="1"
-
-    read -p "是否开启 IPv4 转发? [y/N]: " ans
-    [[ "$ans" =~ ^[Yy]$ ]] && ipv4_forward="1" || ipv4_forward="0"
-
-    if [[ "$has_ipv6" == "1" ]]; then
-        read -p "是否开启 IPv6 转发? [y/N]: " ans
-        [[ "$ans" =~ ^[Yy]$ ]] && ipv6_forward="1" || ipv6_forward="0"
-    else
-        ipv6_forward="0"
-        log_info "未检测到可用 IPv6，已跳过 IPv6 转发提问"
-    fi
-
-    template_candidate=$(mktemp)
-    bdp_candidate=$(mktemp)
-    merged_candidate=$(mktemp)
-    decision_file=$(mktemp)
-
-    build_serverspan_candidate_file "$use_case" "$template_candidate" 0 || {
-        rm -f "$template_candidate" "$bdp_candidate" "$merged_candidate" "$decision_file"
-        log_error "构建外部模板候选失败"
-        return 1
-    }
-
-    ram_gb="${SERVERSPAN_BUILD_RAM:-$(detect_serverspan_ram_gb)}"
-    threads="${SERVERSPAN_BUILD_THREADS:-$(detect_serverspan_threads)}"
-    qdisc=$(read_sysctl_value_from_file "$template_candidate" "net.core.default_qdisc" 2>/dev/null || true)
-    [[ "$qdisc" == "cake" ]] || qdisc="fq"
-
-    buffer_bytes=$(calc_smart_bdp_buffer_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb" "$rtt_mode")
-    buffer_mib=$(format_mib_from_bytes "$buffer_bytes")
-    write_smart_bdp_sysctl "$bdp_candidate" "$bandwidth_mbps" "$bandwidth_source" "$rtt_ms" "$rtt_mode" "$rtt_target" "$buffer_bytes" "$ram_gb" "$threads" "$qdisc"
-    write_unified_auto_candidate "$template_candidate" "$bdp_candidate" "$merged_candidate" "$decision_file"
-    preview_unified_auto_candidate "$merged_candidate" "$decision_file" "$use_case" "$SERVERSPAN_BUILD_SOURCE" "$bandwidth_mbps" "$bandwidth_source" "$rtt_ms" "$rtt_source" "$rtt_target"
-    log_info "最终 TCP max 目标: ${buffer_mib} MiB"
-
-    read -p "是否应用以上统一自动配置? [Y/n]: " ans
-    if [[ "$ans" =~ ^[Nn]$ ]]; then
-        log_info "已取消应用，候选配置未写入系统"
-        rm -f "$template_candidate" "$bdp_candidate" "$merged_candidate" "$decision_file"
-        return 0
-    fi
-
-    create_config_snapshot "before_unified_auto_${use_case}_${bandwidth_source}_${rtt_mode}"
-    if [[ -f "$AUTO_MERGED_SYSCTL_FILE" ]]; then
-        cp "$AUTO_MERGED_SYSCTL_FILE" "${AUTO_MERGED_SYSCTL_FILE}.backup.$(date +%Y%m%d%H%M%S)"
-    fi
-    rm -f "$SERVERSPAN_SYSCTL_FILE" "$SMART_BDP_SYSCTL_FILE"
-    cp "$merged_candidate" "$AUTO_MERGED_SYSCTL_FILE"
-
-    write_forwarding_overlay "$ipv4_forward" "$ipv6_forward"
-    if [[ "$prefer_ipv4" == "1" ]]; then
-        apply_ipv4_preference_no_disable_ipv6 1
-    fi
-
-    sysctl -p "$AUTO_MERGED_SYSCTL_FILE" >/dev/null 2>&1 || true
-    if [[ -f "$FORWARDING_OVERLAY_FILE" ]]; then
-        sysctl -p "$FORWARDING_OVERLAY_FILE" >/dev/null 2>&1 || true
-    fi
-    sysctl --system >/dev/null 2>&1 || true
-
-    rm -f "$template_candidate" "$bdp_candidate" "$merged_candidate" "$decision_file"
-
-    log_success "统一自动调优已应用: $AUTO_MERGED_SYSCTL_FILE"
-    log_info "来源策略: 基线保留 + 外部模板补齐 + Smart BDP 修正 TCP buffer"
-    log_info "生效摘要: ${SERVERSPAN_BUILD_SOURCE}, ${bandwidth_source}/${bandwidth_mbps}Mbps, ${rtt_source}/${rtt_ms}ms => TCP max ${buffer_mib} MiB"
-    verify_installation
-}
-
 run_self_test_dry_run() {
-    local old_snapshot_root="$SNAPSHOT_ROOT"
-    local old_provider_baseline_file="$PROVIDER_BASELINE_FILE"
-    local old_provider_baseline_meta="$PROVIDER_BASELINE_META"
-    local old_provider_baseline_sourcemap="$PROVIDER_BASELINE_SOURCEMAP"
-    local old_serverspan_sysctl_file="$SERVERSPAN_SYSCTL_FILE"
-    local old_smart_bdp_sysctl_file="$SMART_BDP_SYSCTL_FILE"
-    local old_auto_merged_sysctl_file="$AUTO_MERGED_SYSCTL_FILE"
-    local old_forwarding_overlay_file="$FORWARDING_OVERLAY_FILE"
-
-    local temp_root use_case bandwidth_mbps rtt_ms qdisc ram_gb threads
-    local serverspan_candidate smart_candidate unified_template_candidate unified_candidate
-    local unified_decision_file buffer_bytes buffer_mib failed=0
-
-    log_section "Self-Test / Dry-Run"
-    log_info "本模式不会写入 /etc/sysctl.d，不会创建快照，不会执行 sysctl --system。"
-
-    detect_os
-    detect_kernel
-    detect_pkg_manager
-
-    temp_root=$(mktemp -d)
-    SNAPSHOT_ROOT="$temp_root"
-    PROVIDER_BASELINE_FILE="$temp_root/provider-baseline.sysctl"
-    PROVIDER_BASELINE_META="$temp_root/provider-baseline.meta"
-    PROVIDER_BASELINE_SOURCEMAP="$temp_root/provider-baseline-sources.map"
-    SERVERSPAN_SYSCTL_FILE="$temp_root/serverspan-preview.conf"
-    SMART_BDP_SYSCTL_FILE="$temp_root/smart-bdp-preview.conf"
-    AUTO_MERGED_SYSCTL_FILE="$temp_root/auto-merged-preview.conf"
-    FORWARDING_OVERLAY_FILE="$temp_root/forwarding-preview.conf"
-
-    ensure_provider_baseline || true
-
-    use_case="general"
-    bandwidth_mbps=$(detect_selftest_bandwidth_mbps)
-    rtt_ms=$(detect_selftest_rtt_ms "1.1.1.1")
-    log_info "自检参数: use_case=${use_case}, bandwidth=${bandwidth_mbps}Mbps, rtt=${rtt_ms}ms (${SELFTEST_RTT_SOURCE}:${SELFTEST_RTT_TARGET})"
-
-    serverspan_candidate=$(mktemp)
-    if build_serverspan_candidate_file "$use_case" "$serverspan_candidate" 1; then
-        log_success "Serverspan 链路自检通过"
-        preview_sysctl_candidate "$serverspan_candidate" "${SERVERSPAN_BUILD_SOURCE} (dry-run)"
-    else
-        log_error "Serverspan 链路自检失败"
-        failed=$((failed + 1))
-    fi
-
-    smart_candidate=$(mktemp)
-    ram_gb=$(detect_serverspan_ram_gb)
-    threads=$(detect_serverspan_threads)
-    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "fq")
-    [[ "$qdisc" == "cake" ]] || qdisc="fq"
-    buffer_bytes=$(calc_smart_bdp_buffer_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb" "measured")
-    buffer_mib=$(format_mib_from_bytes "$buffer_bytes")
-    write_smart_bdp_sysctl "$smart_candidate" "$bandwidth_mbps" "self-test" "$rtt_ms" "measured" "$SELFTEST_RTT_TARGET" "$buffer_bytes" "$ram_gb" "$threads" "$qdisc"
-    log_success "Smart BDP 链路自检通过"
-    preview_sysctl_candidate "$smart_candidate" "智能 BDP 自检 (dry-run)"
-    log_info "Smart BDP 自检摘要: ${bandwidth_mbps}Mbps + ${rtt_ms}ms => TCP max ${buffer_mib} MiB"
-
-    unified_template_candidate=$(mktemp)
-    unified_candidate=$(mktemp)
-    unified_decision_file=$(mktemp)
-    if build_serverspan_candidate_file "$use_case" "$unified_template_candidate" 0; then
-        ram_gb="${SERVERSPAN_BUILD_RAM:-$ram_gb}"
-        threads="${SERVERSPAN_BUILD_THREADS:-$threads}"
-        qdisc=$(read_sysctl_value_from_file "$unified_template_candidate" "net.core.default_qdisc" 2>/dev/null || true)
-        [[ "$qdisc" == "cake" ]] || qdisc="fq"
-        buffer_bytes=$(calc_smart_bdp_buffer_bytes "$bandwidth_mbps" "$rtt_ms" "$ram_gb" "measured")
-        write_smart_bdp_sysctl "$smart_candidate" "$bandwidth_mbps" "self-test" "$rtt_ms" "measured" "$SELFTEST_RTT_TARGET" "$buffer_bytes" "$ram_gb" "$threads" "$qdisc"
-        write_unified_auto_candidate "$unified_template_candidate" "$smart_candidate" "$unified_candidate" "$unified_decision_file"
-        log_success "统一自动挡链路自检通过"
-        preview_unified_auto_candidate "$unified_candidate" "$unified_decision_file" "$use_case" "$SERVERSPAN_BUILD_SOURCE (dry-run)" "$bandwidth_mbps" "self-test" "$rtt_ms" "measured" "$SELFTEST_RTT_TARGET"
-    else
-        log_error "统一自动挡链路自检失败"
-        failed=$((failed + 1))
-    fi
-
-    echo ""
-    if (( failed == 0 )); then
-        log_success "Self-Test 通过：统一自动挡 / Serverspan / Smart BDP 三条链路均已打通。"
-    else
-        log_warn "Self-Test 完成：共有 ${failed} 条链路失败，请根据上方日志排查。"
-    fi
-    log_info "提示: Self-Test 使用的是检测值和近似值，仅用于链路验证，不代表最终推荐参数。"
-
-    rm -rf "$temp_root"
-    rm -f "$serverspan_candidate" "$smart_candidate" "$unified_template_candidate" "$unified_candidate" "$unified_decision_file"
-    SNAPSHOT_ROOT="$old_snapshot_root"
-    PROVIDER_BASELINE_FILE="$old_provider_baseline_file"
-    PROVIDER_BASELINE_META="$old_provider_baseline_meta"
-    PROVIDER_BASELINE_SOURCEMAP="$old_provider_baseline_sourcemap"
-    SERVERSPAN_SYSCTL_FILE="$old_serverspan_sysctl_file"
-    SMART_BDP_SYSCTL_FILE="$old_smart_bdp_sysctl_file"
-    AUTO_MERGED_SYSCTL_FILE="$old_auto_merged_sysctl_file"
-    FORWARDING_OVERLAY_FILE="$old_forwarding_overlay_file"
-
-    (( failed == 0 ))
-}
-
-apply_serverspan_api_profile() {
-    local use_case="${1:-general}"
-    local non_interactive="${2:-0}"
-    local prefer_ipv4="${3:-}"
-    local ipv4_forward="${4:-}"
-    local ipv6_forward="${5:-}"
-    local has_ipv6=0
-    local candidate_file=""
-    local candidate_source=""
-
-    log_section "Serverspan 自动生成调优配置"
-    detect_os
-    detect_kernel
-    system_has_ipv6 && has_ipv6=1
-
-    if [[ "$non_interactive" != "1" ]]; then
-        local use_case_input
-        read -p "Use Case (默认 general，输入 0 返回): " use_case_input
-        if [[ "$use_case_input" == "0" ]]; then
-            log_info "已取消 Serverspan 自动调优，返回上层菜单"
-            return 0
-        fi
-        use_case="${use_case_input:-$use_case}"
-    fi
-
-    if ! is_valid_serverspan_use_case "$use_case"; then
-        log_error "无效 use_case: ${use_case}"
-        log_info "可用值: general/web/database/cache/network/api 等"
-        return 1
-    fi
-
-    if [[ "$non_interactive" == "1" ]]; then
-        [[ -z "$prefer_ipv4" ]] && prefer_ipv4="1"
-        [[ -z "$ipv4_forward" ]] && ipv4_forward="0"
-        [[ -z "$ipv6_forward" ]] && ipv6_forward="0"
-        if [[ "$has_ipv6" != "1" ]]; then
-            ipv6_forward="0"
-        fi
-    else
-        local ans
-        read -p "是否启用 IPv4 优先（不关闭 IPv6）? [Y/n]: " ans
-        [[ "$ans" =~ ^[Nn]$ ]] && prefer_ipv4="0" || prefer_ipv4="1"
-
-        read -p "是否开启 IPv4 转发? [y/N]: " ans
-        [[ "$ans" =~ ^[Yy]$ ]] && ipv4_forward="1" || ipv4_forward="0"
-
-        if [[ "$has_ipv6" == "1" ]]; then
-            read -p "是否开启 IPv6 转发? [y/N]: " ans
-            [[ "$ans" =~ ^[Yy]$ ]] && ipv6_forward="1" || ipv6_forward="0"
-        else
-            ipv6_forward="0"
-            log_info "未检测到可用 IPv6，已跳过 IPv6 转发提问"
-        fi
-    fi
-
-    candidate_file=$(mktemp)
-    build_serverspan_candidate_file "$use_case" "$candidate_file" 1 || {
-        rm -f "$candidate_file"
-        log_error "构建 Serverspan 候选配置失败"
-        return 1
-    }
-    candidate_source="$SERVERSPAN_BUILD_SOURCE"
-
-    if [[ "$non_interactive" != "1" ]]; then
-        preview_sysctl_candidate "$candidate_file" "$candidate_source"
-        local confirm_apply
-        read -p "是否应用以上自动检测配置? [Y/n]: " confirm_apply
-        if [[ "$confirm_apply" =~ ^[Nn]$ ]]; then
-            log_info "已取消应用，候选配置未写入系统"
-            rm -f "$candidate_file"
-            return 0
-        fi
-    fi
-
-    create_config_snapshot "before_serverspan_api_${use_case}"
-    if [[ -f "$SERVERSPAN_SYSCTL_FILE" ]]; then
-        cp "$SERVERSPAN_SYSCTL_FILE" "${SERVERSPAN_SYSCTL_FILE}.backup.$(date +%Y%m%d%H%M%S)"
-    fi
-    rm -f "$SMART_BDP_SYSCTL_FILE" "$AUTO_MERGED_SYSCTL_FILE"
-    cp "$candidate_file" "$SERVERSPAN_SYSCTL_FILE"
-    rm -f "$candidate_file"
-
-    write_forwarding_overlay "$ipv4_forward" "$ipv6_forward"
-
-    if [[ "$prefer_ipv4" == "1" ]]; then
-        apply_ipv4_preference_no_disable_ipv6 1
-    fi
-
-    sysctl -p "$SERVERSPAN_SYSCTL_FILE" >/dev/null 2>&1 || true
-    if [[ -f "$FORWARDING_OVERLAY_FILE" ]]; then
-        sysctl -p "$FORWARDING_OVERLAY_FILE" >/dev/null 2>&1 || true
-    fi
-    sysctl --system >/dev/null 2>&1 || true
-
-    if [[ "$SERVERSPAN_BUILD_USED_API" == "1" ]]; then
-        log_success "Serverspan 旧 API 调优已应用: $SERVERSPAN_SYSCTL_FILE (use_case=${use_case})"
-    elif [[ "$SERVERSPAN_BUILD_USED_WEB" == "1" ]]; then
-        log_success "已应用 Serverspan 网页生成器调优: $SERVERSPAN_SYSCTL_FILE (use_case=${use_case})"
-    elif [[ "$SERVERSPAN_BUILD_USED_LOCAL" == "1" ]]; then
-        log_success "已应用本地硬件模板回退调优: $SERVERSPAN_SYSCTL_FILE (use_case=${use_case})"
-    else
-        log_warn "调优来源状态未知，但已写入配置文件: $SERVERSPAN_SYSCTL_FILE"
-    fi
-
-    if [[ "$AUTO_BUFFER_FLOOR_APPLIED" == "1" && "$AUTO_BUFFER_ORIGINAL_MAX" =~ ^[0-9]+$ && "$AUTO_BUFFER_TARGET_MAX" =~ ^[0-9]+$ ]]; then
-        log_info "AegisTune TCP 缓冲修正已生效: $(format_mib_from_bytes "$AUTO_BUFFER_ORIGINAL_MAX") MiB -> $(format_mib_from_bytes "$AUTO_BUFFER_TARGET_MAX") MiB"
-    fi
-
-    local live_rmem_max live_rmem_mib
-    live_rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "")
-    if [[ "$use_case" == "general" && "$live_rmem_max" =~ ^[0-9]+$ ]]; then
-        live_rmem_mib=$(awk -v v="$live_rmem_max" 'BEGIN {printf "%.1f", v/1024/1024}')
-        if (( live_rmem_max < 16777216 )); then
-            log_info "说明: 当前是 Serverspan general/moderate 通用保守模板，TCP max 约 ${live_rmem_mib} MiB；如需长 RTT / 高吞吐，请改用 Corona 参数。"
-        fi
-    fi
-    verify_installation
+    log_section "Self-Test / Dry-Run (预览 BDP 缓冲，不写系统)"
+    detect_os; detect_kernel
+    log_info "本模式不写 /etc/sysctl.d、不拍快照、不执行 sysctl。"
+    local qc="${QDISC_CHOICE:-fq}"
+    log_info "qdisc=${qc}, 拥塞控制=bbr"
+    local pair name rtt bw b mib
+    for pair in "亚洲近距:${_BDP_RTT_ASIA}" "跨太平洋:${_BDP_RTT_TRANSPAC}"; do
+        name="${pair%%:*}"; rtt="${pair##*:}"
+        for bw in 500 1000 2000; do
+            b=$(_bdp_buffer_bytes "$bw" "$rtt")
+            mib=$(awk -v v="$b" 'BEGIN{printf "%.1f", v/1048576}')
+            log_info "  ${name} (RTT ${rtt}ms) × ${bw}Mbps → 缓冲 ${mib} MiB (2×BDP, 夹[8,64])"
+        done
+    done
+    log_success "Self-Test 通过：BDP 缓冲计算逻辑正常（未改动系统）。"
 }
 
 # ============ SSH 配置 ============
@@ -6726,7 +3639,7 @@ ssh_login_method_menu() {
 show_help() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║      AegisTune 网络优化助手 (BBR + 扩展模块 + 快照)          ║"
+    echo "║      AegisTune 网络优化助手 (BBR + BDP 缓冲 + 快照)          ║"
     echo "╠══════════════════════════════════════════════════════════════╣"
     echo "║  用法: sudo bash $0 [命令]                                   ║"
     echo "║  注: help / self-test / dry-run 可非 root 运行               ║"
@@ -6736,31 +3649,13 @@ show_help() {
     echo "║    link      - 创建 aeg 短命令 (软链 /usr/local/bin/aeg)     ║"
     echo "║                                                              ║"
     echo "║  网络优化命令:                                               ║"
-    echo "║    install   - 交互式安装 (FQ/CAKE，不安装 bpftune)          ║"
+    echo "║    install   - 交互式安装 (FQ/CAKE，按 BDP 算缓冲)           ║"
     echo "║    uninstall - 卸载网络优化配置                              ║"
     echo "║    status    - 查看当前状态                                  ║"
     echo "║    snapshot  - 创建配置快照                                  ║"
     echo "║    rollback  - 从快照回滚                                    ║"
-    echo "║    bpftune-rm - 检测并删除 bpftune                           ║"
-    echo "║    vendor-check - 检测服务商原生调优参数                     ║"
-    echo "║    vendor-rescan - 搜刮系统配置并重建服务商参数基线          ║"
-    echo "║    vendor-restore - 按服务商参数基线恢复                      ║"
-    echo "║    corona    - 应用 DMIT Corona 参数 (默认/激进)             ║"
-    echo "║    dmit-corona/an4-corona - 直接应用指定 Corona 参数          ║"
-    echo "║    auto-tune - 打开统一自动调优子菜单                         ║"
-    echo "║    auto-unified-manual - 统一自动调优: 手动带宽+地区 RTT      ║"
-    echo "║    auto-unified-speedtest - 统一自动调优: speedtest+地区 RTT  ║"
-    echo "║    auto-unified-rtt - 统一自动调优: 手动带宽+RTT 实测         ║"
-    echo "║    auto-unified-auto-rtt - 统一自动调优: speedtest+RTT 实测   ║"
-    echo "║    self-test/dry-run - 自检三条链路，不改系统                 ║"
-    echo "║    api-sysctl - 兼容模式: Serverspan 自动检测/预览/应用       ║"
-    echo "║    api-general - 一键应用 Serverspan general 默认配置         ║"
-    echo "║    smart-bdp - 打开兼容模式: 智能 BDP 子菜单                  ║"
-    echo "║    smart-bdp-manual - 手动带宽 + 地区估算 RTT                 ║"
-    echo "║    smart-bdp-speedtest - speedtest + 地区估算 RTT            ║"
-    echo "║    smart-bdp-rtt - 手动带宽 + RTT 实测                        ║"
-    echo "║    smart-bdp-auto-rtt - speedtest + RTT 实测                 ║"
-    echo "║    ipv4-prefer - 设置 IPv4 优先 (不关闭 IPv6)                ║"
+    echo "║    fq / cake - 快速装 BBR+FQ / BBR+CAKE (按 BDP 算缓冲)      ║"
+    echo "║    self-test/dry-run - 预览 BDP 缓冲，不改系统               ║"
     echo "║    tools      - 快速补全 Docker Compose / FRPS               ║"
     echo "║    compose-install - 自动安装 Docker Compose                 ║"
     echo "║    frps-install - 下载并执行 FRPS 一键安装脚本               ║"
@@ -6783,90 +3678,12 @@ show_help() {
     echo "║    fail2ban-whitelist-remove [IP] - 安全移除白名单条目       ║"
     echo "║    fail2ban-whitelist-list - 查看配置与运行期 ignoreip       ║"
     echo "║                                                              ║"
-    echo "║  扩展:                                                       ║"
-    echo "║    extensions - 打开 bpftune / Brutal / brutal-nginx 管理    ║"
-    echo "║    brutal     - 安装/加载 TCP Brutal                         ║"
-    echo "║    brutal-ng  - 安装 brutal-nginx 模块                       ║"
     echo "║    help       - 显示此帮助                                   ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
 
 # ============ 交互式菜单 ============
-
-show_extension_menu() {
-    while true; do
-        clear
-        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
-        printf "%b\n" "${CYAN}║         扩展管理 (bpftune / TCP Brutal / brutal-nginx)      ║"
-        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        print_system_status_card
-        echo ""
-        printf "%b\n" "${CYAN}╔══════════════════════════════════════════════════════════════╗"
-        printf "%b\n" "${CYAN}║     1) 查看扩展状态                                          ║"
-        printf "%b\n" "${CYAN}║     2) 安装并启用 bpftune                                    ║"
-        printf "%b\n" "${CYAN}║     3) 彻底删除 bpftune                                      ║"
-        printf "%b\n" "${CYAN}║     4) 安装/加载 TCP Brutal                                  ║"
-        printf "%b\n" "${CYAN}║     5) 彻底删除 TCP Brutal                                   ║"
-        printf "%b\n" "${CYAN}║     6) 安装 brutal-nginx 动态模块                            ║"
-        printf "%b\n" "${CYAN}║     7) 彻底删除 brutal-nginx 模块                            ║"
-        printf "%b\n" "${CYAN}║     0) 返回主菜单                                            ║"
-        printf "%b\n" "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-
-        read -p "请输入选择 [0-7]: " ext_choice
-
-        case $ext_choice in
-            1)
-                print_system_status_card
-                pause_return_main_menu
-                return 0
-                ;;
-            2)
-                detect_os && detect_pkg_manager && detect_init_system && detect_kernel
-                install_bpftune
-                if is_bpftune_installed; then
-                    setup_bpftune_service
-                fi
-                pause_return_main_menu
-                return 0
-                ;;
-            3)
-                detect_pkg_manager
-                remove_bpftune
-                pause_return_main_menu
-                return 0
-                ;;
-            4)
-                install_tcp_brutal
-                pause_return_main_menu
-                return 0
-                ;;
-            5)
-                remove_tcp_brutal
-                pause_return_main_menu
-                return 0
-                ;;
-            6)
-                install_brutal_nginx_module
-                pause_return_main_menu
-                return 0
-                ;;
-            7)
-                remove_brutal_nginx_module
-                pause_return_main_menu
-                return 0
-                ;;
-            0)
-                return 0
-                ;;
-            *)
-                log_error "无效选择"
-                sleep 1
-                ;;
-        esac
-    done
-}
 
 fail2ban_status_view() {
     log_section "Fail2ban 状态 / 封禁 IP"
@@ -6911,17 +3728,15 @@ show_bbr_menu() {
         echo -e "  3) 交互安装             (自选队列调度器)"
         echo -e "  4) 查看加速状态"
         echo -e "  5) 卸载网络优化"
-        echo -e "  6) 进阶扩展模块         (bpftune / TCP Brutal / brutal-nginx)"
         echo -e "  0) 返回主菜单"
         echo ""
-        read -p "请输入选择 [0-6]: " bbr_choice
+        read -p "请输入选择 [0-5]: " bbr_choice
         case "$bbr_choice" in
             1) run_fq_install; pause_return_main_menu ;;
             2) run_cake_install; pause_return_main_menu ;;
             3) run_interactive_install; pause_return_main_menu ;;
             4) run_status_check; pause_return_main_menu ;;
             5) uninstall; pause_return_main_menu ;;
-            6) show_extension_menu ;;
             0) return 0 ;;
             *) log_error "无效选择"; sleep 1 ;;
         esac
@@ -6935,32 +3750,20 @@ show_tuning_menu() {
         printf "%b\n" "${CYAN}║            🎛   系统调优                       ║${NC}"
         printf "%b\n" "${CYAN}╚══════════════════════════════════════════════╝${NC}"
         echo ""
-        echo -e "${YELLOW}  ── 调优 ──${NC}"
-        echo -e "${GREEN}  1) 一键自动调优        (推荐：统一自动挡 / BDP / 自检)${NC}"
-        echo -e "  2) DMIT Corona 预设     (默认 / 激进)"
-        echo -e "  3) IPv4 优先            (不关闭 IPv6)"
-        echo -e "  4) Swap 管理"
-        echo -e "  5) 检测服务商原生基线"
         echo -e "${YELLOW}  ── 备份 / 恢复 (落点 ${AEGIS_HOME}/backups) ──${NC}"
-        echo -e "${GREEN}  6) 📦 备份当前配置${NC}"
-        echo -e "${GREEN}  7) ♻  一键恢复          (从快照回滚)${NC}"
-        echo -e "  8) 备份 / 快照列表"
-        echo -e "  9) 重建服务商基线"
-        echo -e " 10) 按服务商基线恢复"
+        echo -e "${GREEN}  1) 📦 备份当前配置${NC}"
+        echo -e "${GREEN}  2) ♻  一键恢复          (从快照回滚)${NC}"
+        echo -e "  3) 备份 / 快照列表"
+        echo -e "${YELLOW}  ── 系统 ──${NC}"
+        echo -e "  4) Swap 管理"
         echo -e "  0) 返回主菜单"
         echo ""
-        read -p "请输入选择 [0-10]: " tune_choice
+        read -p "请输入选择 [0-4]: " tune_choice
         case "$tune_choice" in
-            1) show_auto_tuning_menu ;;
-            2) apply_corona_profile; pause_return_main_menu ;;
-            3) apply_ipv4_preference_no_disable_ipv6; pause_return_main_menu ;;
+            1) create_config_snapshot "manual_backup"; pause_return_main_menu ;;
+            2) restore_config_snapshot; pause_return_main_menu ;;
+            3) list_config_snapshots; pause_return_main_menu ;;
             4) swap_menu; pause_return_main_menu ;;
-            5) detect_provider_tuning_params; pause_return_main_menu ;;
-            6) create_config_snapshot "manual_backup"; pause_return_main_menu ;;
-            7) restore_config_snapshot; pause_return_main_menu ;;
-            8) list_config_snapshots; pause_return_main_menu ;;
-            9) rebuild_provider_baseline_from_sources; pause_return_main_menu ;;
-            10) restore_provider_tuning_baseline; pause_return_main_menu ;;
             0) return 0 ;;
             *) log_error "无效选择"; sleep 1 ;;
         esac
@@ -7034,8 +3837,8 @@ show_main_menu() {
     echo ""
     print_system_status_card
     echo ""
-    echo -e "${GREEN}  1) 🚀 BBR 加速${NC}          BBR / FQ·CAKE / 扩展模块"
-    echo -e "${YELLOW}  2) 🎛  系统调优${NC}          自动调优 + 备份 / 一键恢复"
+    echo -e "${GREEN}  1) 🚀 BBR 加速${NC}          BBR / FQ·CAKE / 按 BDP 算缓冲"
+    echo -e "${YELLOW}  2) 🎛  系统调优${NC}          备份 / 一键恢复 / Swap"
     echo -e "${MAGENTA}  3) 🛡  安全防护${NC}          Fail2ban / SSH / 端口"
     echo -e "${BLUE}  4) 🔧 系统维护${NC}          工具补全 / 出站守护"
     echo ""
@@ -7067,8 +3870,6 @@ run_fq_install() {
     create_config_snapshot "before_fq_install"
     update_pkg_cache && install_dependencies
     install_kernel_modules && configure_sysctl
-    apply_aggressive_sysctl_overlay
-    log_info "bpftune 已从基础安装流程剥离，如需启用请在扩展管理中单独安装"
     verify_installation && show_final_message
 }
 
@@ -7084,15 +3885,13 @@ run_cake_install() {
     
     update_pkg_cache && install_dependencies
     install_kernel_modules && configure_sysctl
-    apply_aggressive_sysctl_overlay
-    log_info "bpftune 已从基础安装流程剥离，如需启用请在扩展管理中单独安装"
     verify_installation && show_final_message
 }
 
 run_interactive_install() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║      AegisTune 网络优化助手 (BBR + 扩展模块 + 快照)          ║"
+    echo "║      AegisTune 网络优化助手 (BBR + BDP 缓冲 + 快照)          ║"
     echo "║      自动挡调优，省心省力                                     ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -7110,7 +3909,6 @@ run_interactive_install() {
         return 0
     fi
 
-    log_info "基础安装流程不包含 bpftune；如需启用，请在主菜单 5 的扩展管理中单独安装。"
 
     create_config_snapshot "before_interactive_install_${QDISC_CHOICE}"
     
@@ -7118,7 +3916,6 @@ run_interactive_install() {
     install_dependencies
     install_kernel_modules
     configure_sysctl
-    apply_aggressive_sysctl_overlay
     verify_installation
     show_final_message
 }
@@ -7165,8 +3962,6 @@ main() {
             create_config_snapshot "before_cli_fq_install"
             update_pkg_cache && install_dependencies
             install_kernel_modules && configure_sysctl
-            apply_aggressive_sysctl_overlay
-            log_info "bpftune 已从基础安装流程剥离，如需启用请在扩展管理中单独安装"
             verify_installation && show_final_message
             ;;
         
@@ -7182,8 +3977,6 @@ main() {
             
             update_pkg_cache && install_dependencies
             install_kernel_modules && configure_sysctl
-            apply_aggressive_sysctl_overlay
-            log_info "bpftune 已从基础安装流程剥离，如需启用请在扩展管理中单独安装"
             verify_installation && show_final_message
             ;;
         
@@ -7209,10 +4002,6 @@ main() {
             list_config_snapshots
             ;;
 
-        bpftune-rm|bpftune-remove)
-            detect_pkg_manager
-            remove_bpftune
-            ;;
 
         fail2ban)
             install_fail2ban_basic
@@ -7234,9 +4023,6 @@ main() {
             fail2ban_whitelist_view
             ;;
 
-        extensions|extension|ext)
-            show_extension_menu
-            ;;
 
         tools|tooling|quick-tools)
             show_tools_menu
@@ -7297,97 +4083,31 @@ main() {
             traffic_guard_remove
             ;;
 
-        vendor-check|provider-check|baseline-check)
-            detect_provider_tuning_params
-            ;;
 
-        vendor-rescan|provider-rescan|baseline-rescan)
-            rebuild_provider_baseline_from_sources
-            ;;
 
-        vendor-restore|provider-restore|baseline-restore)
-            restore_provider_tuning_baseline
-            ;;
 
-        corona)
-            apply_corona_profile
-            ;;
 
-        dmit-corona|corona-dmit)
-            apply_corona_profile dmit
-            ;;
 
-        an4-corona|lax-an4-eb-corona|corona-an4)
-            apply_corona_profile an4
-            ;;
 
-        api-sysctl|serverspan-api)
-            apply_serverspan_api_profile general 0
-            ;;
 
-        api-general|serverspan-general)
-            apply_serverspan_api_profile general 1 1 0 0
-            ;;
 
-        smart-bdp|bdp-auto|smart-auto)
-            show_smart_bdp_menu
-            ;;
 
-        smart-bdp-manual|bdp-manual)
-            apply_smart_bdp_profile manual region
-            ;;
 
-        smart-bdp-speedtest|bdp-speedtest)
-            apply_smart_bdp_profile speedtest region
-            ;;
 
-        smart-bdp-rtt|bdp-rtt)
-            apply_smart_bdp_profile manual measured
-            ;;
 
-        smart-bdp-auto-rtt|bdp-auto-rtt)
-            apply_smart_bdp_profile speedtest measured
-            ;;
 
-        auto-unified-manual|auto-merge-manual|unified-manual)
-            apply_unified_auto_profile manual region
-            ;;
 
-        auto-unified-speedtest|auto-merge-speedtest|unified-speedtest)
-            apply_unified_auto_profile speedtest region
-            ;;
 
-        auto-unified-rtt|auto-merge-rtt|unified-rtt)
-            apply_unified_auto_profile manual measured
-            ;;
 
-        auto-unified-auto-rtt|auto-merge-auto-rtt|unified-auto-rtt)
-            apply_unified_auto_profile speedtest measured
-            ;;
 
         self-test|dry-run|auto-self-test|auto-dry-run)
             run_self_test_dry_run
             ;;
 
-        auto-tune|auto-tuning)
-            show_auto_tuning_menu
-            ;;
 
-        ipv4-prefer|prefer-ipv4)
-            apply_ipv4_preference_no_disable_ipv6
-            ;;
 
-        brutal)
-            install_tcp_brutal
-            ;;
 
-        brutal-rm|brutal-remove)
-            remove_tcp_brutal
-            ;;
 
-        brutal-ng|brutal-nginx)
-            install_brutal_nginx_module
-            ;;
         
         ssh)
             detect_os && detect_init_system

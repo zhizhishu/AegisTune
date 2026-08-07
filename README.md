@@ -74,27 +74,20 @@ sudo ./aegistune.sh setup
 - 交互安装（自选队列调度器）
 - 查看加速状态
 - 卸载网络优化
-- 进阶扩展模块（`bpftune` / `TCP Brutal` / `brutal-nginx`）
 
-> 基础安装默认不带 `bpftune`，如需启用请进「进阶扩展模块」单独安装。
+> 装 `FQ` / `CAKE` 时会先问**线路区域（亚洲近距 / 跨太平洋）+ 带宽**，按 **BDP（带宽 × RTT）** 自动算 TCP 缓冲；写出的 `sysctl` 只有 `BBR + 队列调度 + 缓冲`，不再无条件灌 fastopen / mtu_probing 等一堆固定基线。详见下方「BDP 缓冲自动计算」。
 
 ### 2) 🎛 系统调优
-
-调优：
-
-- 一键自动调优（推荐：统一自动挡 / 智能 BDP / 自检）
-- DMIT Corona 预设（默认 / 激进）
-- IPv4 优先（不关闭 IPv6）
-- Swap 管理
-- 检测服务商原生基线
 
 备份 / 恢复（落点 `/root/AegisTune/backups`）：
 
 - 📦 备份当前配置
 - ♻ 一键恢复（从快照回滚）
 - 备份 / 快照列表
-- 重建服务商基线
-- 按服务商基线恢复
+
+系统：
+
+- Swap 管理（智能计算大小 + 磁盘余量护栏，防 OOM）
 
 ### 3) 🛡 安全防护
 
@@ -103,11 +96,11 @@ Fail2ban：
 - 启用 Fail2ban（SSH 暴力破解防护）
 - 移除 Fail2ban
 - 查看封禁 IP / 状态
+- Fail2ban 白名单（加白 / 移除 / 查看，安全写入防挂服务）
 
 SSH / 端口：
 
-- 开启 SSH root 密码登录
-- 禁用 SSH 密码登录（仅密钥）
+- SSH 登录方式管理（密码 / 密钥 / 公钥开关，带锁死护栏）
 - 常用端口检查 / 修复（22 / 80 / 443）
 - 查看全部监听端口
 - 安全摘要检查（SSH / 端口 / cron / authorized_keys）
@@ -129,12 +122,12 @@ SSH / 端口：
 
 ### 跨发行版兼容
 
-本轮已针对非 Debian / 非 systemd 环境做兼容修复：
+已针对非 Debian / 非 systemd 环境做兼容修复：
 
 - Fail2ban：在 RHEL 系（Rocky / Alma / CentOS）会自动启用 EPEL 后再安装
 - CAKE：在 RHEL 系走 `kernel-modules-extra` 获取队列模块
-- bpftune：在缺少 systemd 的环境补齐 SysV 服务脚本
 - 内核模块开机加载：非 systemd 环境写入 `/etc/modules` 保证重启后仍加载
+- 内存读取走 `/proc/meminfo`，不依赖 `procps`（`free`），精简镜像也能正确取值
 
 ## Backup & Restore
 
@@ -151,88 +144,61 @@ SSH / 端口：
 - 支持「一键恢复」直接从快照回滚
 - 支持查看快照列表，逐个比对回滚
 
-## Unified Auto Mode
+## BDP 缓冲自动计算
 
-默认推荐使用的是 `统一自动调优`，不是单独的 `Serverspan` 或单独的 `Smart BDP`。
+AegisTune 不再堆一堆重复的「自动调优档」。装 `FQ` / `CAKE` 时只问两件事，按 **BDP（Bandwidth-Delay Product，带宽 × 延迟）** 算 TCP 缓冲：
 
-它的决策顺序是：
+1. **线路区域**（决定 RTT）：
+   - 亚洲近距（RTT ≈ 50ms）
+   - 跨太平洋（RTT ≈ 150ms）
+   - 或直接输入实测 RTT
+2. **端口 / 线路带宽**（Mbps）
 
-1. 先读取当前机器可识别的 `原厂/服务商基线`
-2. 再生成 `Serverspan` 模板；如果外站不可用，则退回本地硬件模板
-3. 最后用 `Smart BDP` 只接管 TCP buffer 相关项
-4. 应用前展示决策预览表，明确标出：
-   - 最终值
-   - 来源
-   - 基线值
-   - 模板值
-   - BDP 候选值
+计算规则：
 
-这样做的目的，是避免只信任某一个来源：
+- `BDP = 带宽(Mbps) × RTT(ms) × 125`（字节）
+- 缓冲取 **2 × BDP**（生产环境推荐系数，覆盖 RTT 抖动 / 突发 / 多连接）
+- 夹在 **[8 MiB, 64 MiB]** 之间（BBR 本身不依赖超大缓冲，>64MB 无额外收益还占内存）
 
-- 尽量保留服务商 / 镜像本来的合理参数
-- 不丢掉外部模板对通用项的补齐
-- 不再盲信 `Serverspan general` 这类过小 TCP buffer
+举例：跨太平洋 1Gbps → `2 × (1000 × 150 × 125)` ≈ 37.5MB；亚洲近距 1Gbps → 约 12MB。
 
-## Serverspan Auto Mode
+写出的 `sysctl` 只有 **拥塞控制 + 队列调度 + 按 BDP 算的缓冲**，纯净、可解释：
 
-`Serverspan general/moderate` 当前返回的 TCP 缓冲偏保守，常见会落在 `4-8 MiB` 档。
+```ini
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = <2×BDP>
+net.core.wmem_max = <2×BDP>
+net.ipv4.tcp_rmem = 4096 <BDP/4> <2×BDP>
+net.ipv4.tcp_wmem = 4096 <BDP/4> <2×BDP>
+```
 
-AegisTune 的自动挡现在会：
-
-- 先保留 `Serverspan` 生成的其余 `sysctl` 参数
-- 读取返回的 `net.core.rmem_max`
-- 如果低于脚本的自动最低档，则仅覆盖 TCP 缓冲相关项
-- 在预览和应用日志中显示“原值 -> 修正值”
-
-这样做的目的，是避免自动挡在 `8GB`、`12GB`、`16GB` 这类机器上仍然落到 `3.9 MiB` 一类明显过小的窗口。
-
-## Smart BDP Mode
-
-除了 `Serverspan` 自动挡，AegisTune 还提供 `智能 BDP 自动调优`。
-
-它借鉴了 `vps-tcp-tune` 的思路，但没有直接照搬整套代理专用参数，而是只保留通用且可解释的部分：
-
-- 带宽来源可选：
-  - 手动输入上传带宽
-  - `speedtest` 自动检测上传带宽
-- RTT 来源可选：
-  - 按地区使用默认 RTT 估值
-  - 对目标域名 / IP 做 `ping` 实测 RTT
-- 最终根据 `带宽 × RTT` 计算 BDP，再叠加安全系数生成 TCP buffer
-- 结果会按机器内存做安全上限限制，避免小内存机器直接冲到不合理窗口
-
-这套模式更适合：
-
-- 跨境线路
-- 长 RTT
-- 明确知道自己出口带宽
-- 不想直接套 `Corona` 固定值，但也不接受 `Serverspan general` 的小窗口
+> 非交互运行（管道 / CI）默认按「跨太平洋 + 1000Mbps」取值，也可用环境变量覆盖：`AEGIS_RTT_MS` / `AEGIS_BW_MBPS`。
 
 ## Self-Test / Dry-Run
 
-如果你只想先验证三条自动调优链路能否跑通，而不改系统，可以直接运行：
+只想验证 BDP 缓冲计算逻辑、不改系统，直接运行：
 
 ```bash
 ./aegistune.sh self-test
 ./aegistune.sh dry-run
 ```
 
-这个命令默认：
+它：
 
 - 不要求 root
-- 不写 `/etc/sysctl.d`
-- 不创建快照
-- 不执行 `sysctl --system`
-- 会依次生成并展示：
-  - `Serverspan` dry-run 预览
-  - `Smart BDP` dry-run 预览
-  - `统一自动挡` dry-run 决策预览
+- 不写 `/etc/sysctl.d`、不创建快照、不执行 `sysctl`
+- 打印两档区域（亚洲近距 / 跨太平洋）× 三档带宽（500 / 1000 / 2000 Mbps）算出的缓冲预览表，方便上线前核对
 
-说明：
+## Swap 智能计算
 
-- `self-test` 用的是探测值和近似值，只用于验证链路是否正常
-- 它不是最终推荐参数生成器
-- 真正应用参数仍然建议走主菜单里的自动调优
+「系统调优 → Swap 管理 → 创建 Swap」按物理内存分档推荐大小，并带两道护栏防止翻车：
+
+- 分档：`<512MB → 1GB`、`512MB–1GB → 2×内存`、`1–2GB → 1.5×内存`、`2–4GB → 1×内存`、`≥4GB → 封顶 4GB`
+- **磁盘余量护栏**：创建前检查根分区剩余空间，不足则中止，避免把小盘撑爆
+- **已有 Swap 检测**：先列出现有 Swap，询问替换 / 跳过，不无脑叠加
+- `swappiness`：内存 < 2GB 设 20，否则 10
+- 内存读取走 `/proc/meminfo`，精简镜像无 `free` 也能算
 
 ## Docker Compose Install Logic
 
@@ -321,10 +287,7 @@ sudo aegistune.sh reinstall-cmd    # 只打印两条官方命令，不执行
 - 系统重装（DD / 容器）会**擦除整机数据并重装系统**，不可逆；仅在交互二次输入 `REINSTALL` 后才执行，且请先把数据备份到机器之外
 - 出站流量守护达到阈值后会**真实关机**；启用前请确认监控网卡和流量上限
 - FRPS 使用第三方一键脚本，建议先确认其行为再在线上机器执行
-- `TCP Brutal` 不应被设为全局默认拥塞控制，脚本里已有保护逻辑
-- `brutal-nginx` 依赖当前 `nginx` 版本和兼容编译参数
-- `Serverspan general` 是偏保守模板，不等于 Corona 大缓冲档
-- 服务商基线恢复依赖当前系统可搜集到的配置来源，不保证百分之百还原“出厂态”
+- 创建 Swap 前会检查磁盘余量，不足即中止；但仍建议自行确认根分区空间
 
 ## Common Commands
 
@@ -333,37 +296,12 @@ sudo aegistune.sh reinstall-cmd    # 只打印两条官方命令，不执行
 sudo ./aegistune.sh
 sudo ./aegistune.sh link          # 安装 aeg 短命令
 
-# BBR 加速
+# BBR 加速（装时按 BDP 算缓冲）
 sudo ./aegistune.sh fq
 sudo ./aegistune.sh cake
 sudo ./aegistune.sh install
 sudo ./aegistune.sh status
 sudo ./aegistune.sh uninstall
-sudo ./aegistune.sh extensions
-sudo ./aegistune.sh brutal
-sudo ./aegistune.sh brutal-ng
-sudo ./aegistune.sh bpftune-rm
-
-# 系统调优
-sudo ./aegistune.sh auto-tune
-sudo ./aegistune.sh auto-unified-manual
-sudo ./aegistune.sh auto-unified-speedtest
-sudo ./aegistune.sh auto-unified-rtt
-sudo ./aegistune.sh auto-unified-auto-rtt
-sudo ./aegistune.sh smart-bdp
-sudo ./aegistune.sh smart-bdp-manual
-sudo ./aegistune.sh smart-bdp-speedtest
-sudo ./aegistune.sh smart-bdp-rtt
-sudo ./aegistune.sh smart-bdp-auto-rtt
-sudo ./aegistune.sh corona
-sudo ./aegistune.sh dmit-corona
-sudo ./aegistune.sh an4-corona
-sudo ./aegistune.sh api-sysctl
-sudo ./aegistune.sh api-general
-sudo ./aegistune.sh ipv4-prefer
-sudo ./aegistune.sh vendor-check
-sudo ./aegistune.sh vendor-rescan
-sudo ./aegistune.sh vendor-restore
 
 # 备份 / 恢复
 sudo ./aegistune.sh snapshot
@@ -373,8 +311,12 @@ sudo ./aegistune.sh snapshots
 # 安全防护
 sudo ./aegistune.sh fail2ban
 sudo ./aegistune.sh fail2ban-rm
+sudo ./aegistune.sh fail2ban-whitelist-add [IP]
+sudo ./aegistune.sh fail2ban-whitelist-remove [IP]
+sudo ./aegistune.sh fail2ban-whitelist-list
 sudo ./aegistune.sh ssh
 sudo ./aegistune.sh ssh-off
+sudo ./aegistune.sh ssh-pubkey-off
 
 # 系统维护
 sudo ./aegistune.sh tools
