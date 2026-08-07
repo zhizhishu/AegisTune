@@ -1429,30 +1429,47 @@ smart_swap_size_mb() {
 swap_create() {
     log_section "创建 Swap"
 
-    # 检测已有 swap
+    # 检测已有 swap（读 /proc/swaps，兼容 busybox/Alpine，避免 swapon --show 不可用）
     local existing_swap
-    existing_swap=$(swapon --show 2>/dev/null | grep -v '^NAME' || true)
+    existing_swap=$(grep -v '^Filename' /proc/swaps 2>/dev/null)
     if [[ -n "$existing_swap" ]]; then
         log_info "检测到已有 Swap:"
         echo "$existing_swap"
         echo ""
-        read -r -p "已有 Swap，是否替换？[y/N]: " replace_choice
+        # 检查是否含非 /swapfile 的 swap（如分区 swap）
+        local non_swapfile
+        non_swapfile=$(echo "$existing_swap" | awk '{print $1}' | grep -v '^/swapfile$' || true)
+        if [[ -n "$non_swapfile" ]]; then
+            log_warn "注意: 检测到本工具不管理的 swap 项（如分区 swap）:"
+            echo "$non_swapfile"
+            log_warn "本工具只管理 /swapfile，上述 swap 将保持不动，不会被替换。"
+            echo ""
+        fi
+        read -r -p "是否替换 /swapfile？[y/N]: " replace_choice
         if [[ "${replace_choice,,}" != "y" ]]; then
             log_info "已跳过 Swap 创建"
             return 0
         fi
     fi
 
-    # 推荐大小
-    local rec_mb
+    # 推荐大小，输入校验（非法重试，最多 3 次；回车使用推荐值）
+    local rec_mb swap_size
     rec_mb=$(smart_swap_size_mb)
     log_info "推荐 Swap 大小: ${rec_mb}MB（基于内存和磁盘余量）"
-    read -r -p "请输入 Swap 大小 (MB，回车使用推荐值 ${rec_mb}): " swap_size
-    [[ -z "$swap_size" ]] && swap_size=$rec_mb
-    if ! [[ "$swap_size" =~ ^[0-9]+$ ]] || (( swap_size < 256 )); then
-        log_error "无效大小: ${swap_size}，最小 256MB"
-        return 1
-    fi
+    local input_attempts=0
+    while true; do
+        read -r -p "请输入 Swap 大小 (MB，回车使用推荐值 ${rec_mb}): " swap_size
+        [[ -z "$swap_size" ]] && swap_size=$rec_mb
+        if [[ "$swap_size" =~ ^[0-9]+$ ]] && (( swap_size >= 256 )); then
+            break
+        fi
+        input_attempts=$(( input_attempts + 1 ))
+        if (( input_attempts >= 3 )); then
+            log_error "输入无效次数过多，已中止"
+            return 1
+        fi
+        log_error "无效大小: ${swap_size}，最小 256MB，请重新输入"
+    done
 
     # 磁盘余量护栏
     local disk_free_mb
@@ -1476,8 +1493,16 @@ swap_create() {
         fi
     fi
     chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
+    if ! mkswap /swapfile; then
+        log_error "mkswap 失败，Swap 创建中止"
+        rm -f /swapfile
+        return 1
+    fi
+    if ! swapon /swapfile; then
+        log_error "swapon 失败，Swap 创建中止"
+        rm -f /swapfile
+        return 1
+    fi
 
     if ! grep -q "/swapfile" /etc/fstab; then
         echo "/swapfile none swap sw 0 0" >> /etc/fstab
@@ -1509,8 +1534,20 @@ swap_delete() {
 
 swap_set_swappiness() {
     log_section "调整 vm.swappiness"
-    read -p "请输入 swappiness (0-100，默认 60): " new_val
-    [[ -z "$new_val" ]] && new_val=60
+    local new_val input_attempts=0
+    while true; do
+        read -p "请输入 swappiness (0-100，回车使用默认值 60): " new_val
+        [[ -z "$new_val" ]] && new_val=60
+        if [[ "$new_val" =~ ^[0-9]+$ ]] && (( new_val >= 0 && new_val <= 100 )); then
+            break
+        fi
+        input_attempts=$(( input_attempts + 1 ))
+        if (( input_attempts >= 3 )); then
+            log_error "输入无效次数过多，已中止"
+            return 1
+        fi
+        log_error "无效值: ${new_val}，请输入 0-100 之间的整数"
+    done
     sysctl -w vm.swappiness=$new_val >/dev/null
     if grep -q "vm.swappiness" /etc/sysctl.conf; then
         sed -i "s/^vm.swappiness.*/vm.swappiness = $new_val/" /etc/sysctl.conf
