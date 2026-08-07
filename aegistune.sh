@@ -12,9 +12,8 @@
 # 任何一步非零都会把整个脚本踹回 shell、直接退出菜单。本脚本各处已用
 # `|| true` / 显式 return / log_error 自行处理错误，不依赖 set -e。
 set +e
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ============ 通用工具 ============ 
+# ============ 通用工具 ============
 
 get_ssh_port() {
     local port
@@ -23,15 +22,12 @@ get_ssh_port() {
     echo "$port"
 }
 
-# 避坑：防止将 brutal 设为全局拥塞控制
+# 避坑：防止将 brutal 设为全局拥塞控制（只检测警告，不写系统）
 ensure_brutal_not_default() {
     local cc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
     if [[ "$cc" == "brutal" ]]; then
-        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-        echo "net.ipv4.tcp_congestion_control=bbr" > /etc/sysctl.d/99-cc.conf
-        sysctl --system >/dev/null 2>&1 || true
-        log_warn "检测到默认拥塞控制为 brutal，已改回 bbr 以避免全局 1MB/s 限速。"
+        log_warn "检测到 brutal 为全局拥塞控制，建议改回 bbr，可重新安装或手动执行：sysctl -w net.ipv4.tcp_congestion_control=bbr"
     fi
 }
 
@@ -253,18 +249,6 @@ service_action_any() {
     esac
 
     return 1
-}
-
-service_reload_or_restart_any() {
-    local manager
-    manager="$(get_service_manager)"
-
-    if [[ "$manager" == "systemd" ]]; then
-        service_action_any reload "$@" || service_action_any restart "$@"
-        return $?
-    fi
-
-    service_action_any restart "$@"
 }
 
 service_enable_any() {
@@ -2804,34 +2788,6 @@ restore_config_snapshot() {
     log_success "已回滚至快照: $(basename "$target_snap")"
 }
 
-snapshot_menu() {
-    log_section "快照管理"
-    echo "1) 创建快照"
-    echo "2) 从快照回滚"
-    echo "3) 查看快照列表"
-    echo "0) 返回上层菜单"
-    read -p "请选择 [1-3/0]: " snapshot_choice
-    case $snapshot_choice in
-        1)
-            read -p "请输入快照备注(可选): " snapshot_note
-            [[ -z "$snapshot_note" ]] && snapshot_note="manual_snapshot"
-            create_config_snapshot "$snapshot_note"
-            ;;
-        2)
-            restore_config_snapshot
-            ;;
-        3)
-            list_config_snapshots
-            ;;
-        0)
-            return 0
-            ;;
-        *)
-            log_warn "无效选择"
-            ;;
-    esac
-}
-
 print_system_status_card() {
     echo -e "${CYAN}┌──────────────────────────────────────────────────┐${NC}"
     echo -e "${CYAN}│              📊 系统状态面板                     │${NC}"
@@ -3157,43 +3113,10 @@ truncate_status_value() {
     fi
 }
 
-strip_ansi_codes() {
-    printf '%s' "$1" | sed -E $'s/\x1B\\[[0-9;]*m//g'
-}
-
 render_status_card_line() {
     local label="$1"
     local value="$2"
     printf "%b\n" "${CYAN}│${NC}  ${label} ${value}"
-}
-
-get_visible_text_length() {
-    local stripped
-    stripped=$(strip_ansi_codes "$1")
-    printf '%s' "$stripped" | awk '{print length($0)}'
-}
-
-pad_status_panel_cell() {
-    local content="$1"
-    local width="$2"
-    local visible_len
-    visible_len=$(get_visible_text_length "$content")
-    if [[ -z "$visible_len" || "$visible_len" -ge "$width" ]]; then
-        printf '%s' "$content"
-    else
-        printf '%s%*s' "$content" "$((width - visible_len))" ""
-    fi
-}
-
-render_status_panel_row() {
-    local left="$1"
-    local right="$2"
-    local left_width="${3:-22}"
-    local right_width="${4:-23}"
-    local left_padded right_padded
-    left_padded=$(pad_status_panel_cell "$left" "$left_width")
-    right_padded=$(pad_status_panel_cell "$right" "$right_width")
-    printf "%b\n" "${CYAN}│${NC} ${left_padded} ${CYAN}│${NC} ${right_padded} ${CYAN}│${NC}"
 }
 
 get_ipv4_forwarding_status() {
