@@ -471,28 +471,6 @@ check_qdisc_support() {
     log_info "当前队列调度: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
 }
 
-check_bpf_support() {
-    log_section "eBPF 支持检测"
-    
-    # 挂载 BPF 文件系统
-    if ! mount | grep -q "type bpf"; then
-        mkdir -p /sys/fs/bpf 2>/dev/null || true
-        mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
-    fi
-    
-    if mount | grep -q "type bpf"; then
-        log_success "BPF 文件系统已挂载"
-    else
-        log_warn "BPF 文件系统挂载失败"
-    fi
-    
-    if [[ -f /sys/kernel/btf/vmlinux ]]; then
-        log_success "BTF (BPF Type Format) 支持可用"
-    else
-        log_warn "BTF 不可用，bpftune 可能无法工作"
-    fi
-}
-
 # ============ 用户选择菜单 ============
 
 show_qdisc_menu() {
@@ -618,13 +596,13 @@ install_dependencies() {
     
     case $PKG_MANAGER in
         apt)
-            apt-get install -y -qq curl wget ca-certificates gnupg bc
+            apt-get install -y -qq curl wget ca-certificates gnupg
             ;;
         apk)
-            apk add --quiet curl wget ca-certificates bc
+            apk add --quiet curl wget ca-certificates
             ;;
         dnf|yum)
-            $PKG_MANAGER install -y -q curl wget ca-certificates gnupg bc
+            $PKG_MANAGER install -y -q curl wget ca-certificates gnupg
             ;;
     esac
     
@@ -2622,44 +2600,6 @@ show_traffic_guard_menu() {
     done
 }
 
-configure_static_buffers() {
-    log_info "配置静态 TCP 缓冲区 (bpftune 替代方案)..."
-    
-    local STATIC_CONFIG="
-# === 静态缓冲区配置 (bpftune 不可用时使用) ===
-# 设置合理的自适应范围，让内核自动调整
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 1048576 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216"
-    
-    # 追加到 sysctl.d 配置文件
-    echo "$STATIC_CONFIG" >> /etc/sysctl.d/99-bbr-tuning.conf
-    
-    # Alpine 兼容：同时写入主配置文件
-    if [[ "$OS_TYPE" == "alpine" ]]; then
-        echo "$STATIC_CONFIG" >> /etc/sysctl.conf
-        log_info "Alpine: 配置已写入 /etc/sysctl.conf"
-    fi
-    
-    # 应用配置 (兼容 Alpine 和 Debian/Ubuntu)
-    if [[ -f /etc/sysctl.d/99-bbr-tuning.conf ]]; then
-        sysctl -p /etc/sysctl.d/99-bbr-tuning.conf 2>/dev/null || true
-    fi
-    sysctl -p /etc/sysctl.conf 2>/dev/null || true
-    
-    # 验证是否生效
-    local current_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
-    if [[ "$current_rmem" -ge 16777216 ]]; then
-        log_success "静态缓冲区配置完成 (rmem_max: ${current_rmem})"
-    else
-        log_warn "配置可能未完全生效，当前 rmem_max: ${current_rmem}"
-        log_info "请手动运行: sysctl -p /etc/sysctl.conf"
-    fi
-}
-
 snapshot_tracked_files() {
     cat <<'EOF'
 /etc/sysctl.conf
@@ -3866,7 +3806,7 @@ run_fq_install() {
     QDISC_CHOICE="fq"
     echo -e "${CYAN}安装模式: BBR + FQ${NC}"
     detect_os && detect_pkg_manager && detect_init_system && detect_kernel
-    check_bpf_support && check_bbr_support && check_qdisc_support
+    check_bbr_support && check_qdisc_support
     create_config_snapshot "before_fq_install"
     update_pkg_cache && install_dependencies
     install_kernel_modules && configure_sysctl
@@ -3877,7 +3817,7 @@ run_cake_install() {
     QDISC_CHOICE="cake"
     echo -e "${CYAN}安装模式: BBR + CAKE${NC}"
     detect_os && detect_pkg_manager && detect_init_system && detect_kernel
-    check_bpf_support && check_bbr_support && check_qdisc_support
+    check_bbr_support && check_qdisc_support
     
     if [[ $CAKE_AVAILABLE -eq 0 ]]; then
         install_cake_module
@@ -3900,7 +3840,6 @@ run_interactive_install() {
     detect_pkg_manager
     detect_init_system
     detect_kernel
-    check_bpf_support
     check_bbr_support
     check_qdisc_support
     
@@ -3958,7 +3897,7 @@ main() {
             QDISC_CHOICE="fq"
             echo -e "${CYAN}快速安装模式: BBR + FQ${NC}"
             detect_os && detect_pkg_manager && detect_init_system && detect_kernel
-            check_bpf_support && check_bbr_support && check_qdisc_support
+            check_bbr_support && check_qdisc_support
             create_config_snapshot "before_cli_fq_install"
             update_pkg_cache && install_dependencies
             install_kernel_modules && configure_sysctl
@@ -3969,7 +3908,7 @@ main() {
             QDISC_CHOICE="cake"
             echo -e "${CYAN}快速安装模式: BBR + CAKE${NC}"
             detect_os && detect_pkg_manager && detect_init_system && detect_kernel
-            check_bpf_support && check_bbr_support && check_qdisc_support
+            check_bbr_support && check_qdisc_support
             
             if [[ $CAKE_AVAILABLE -eq 0 ]]; then
                 install_cake_module
