@@ -705,6 +705,23 @@ _bdp_buffer_bytes() {
     echo "$buf"
 }
 
+# 删除 /etc/sysctl.conf 里成对的 AegisTune 标记块；孤儿 BEGIN(无 END)只删该行、保住后面用户内容，
+# 不像裸 sed /BEGIN/,/END/d 那样在标记不成对时误删到 EOF。busybox awk 兼容。
+_strip_aegis_sysctl_block() {
+    local f="${1:-/etc/sysctl.conf}"
+    [[ -f "$f" ]] || return 0
+    local tmp
+    tmp=$(mktemp 2>/dev/null) || return 0
+    awk '
+        /^# === AegisTune BBR BEGIN ===/ { inblk=1; buf=""; next }
+        inblk && /^# === AegisTune BBR END ===/ { inblk=0; next }
+        inblk { buf = buf $0 ORS; next }
+        { print }
+        END { if (inblk) printf "%s", buf }
+    ' "$f" > "$tmp" && cat "$tmp" > "$f"
+    rm -f "$tmp"
+}
+
 configure_sysctl() {
     _bdp_prompt_region_rtt
     _bdp_prompt_bandwidth
@@ -738,7 +755,7 @@ net.ipv4.tcp_wmem = 4096 $_mid $_buf"
         # 备份原配置
         [[ -f /etc/sysctl.conf ]] && cp /etc/sysctl.conf /etc/sysctl.conf.backup 2>/dev/null || true
         # 删除旧标记块（如存在），保证幂等
-        sed -i '/^# === AegisTune BBR BEGIN ===/,/^# === AegisTune BBR END ===/d' /etc/sysctl.conf 2>/dev/null || true
+        _strip_aegis_sysctl_block /etc/sysctl.conf
         {
             printf '\n# === AegisTune BBR BEGIN ===\n'
             echo "$CONFIG_CONTENT"
@@ -2938,7 +2955,7 @@ uninstall() {
 
     # 清理 Alpine: 删除 /etc/sysctl.conf 里的 AegisTune 标记块
     if [[ -f /etc/sysctl.conf ]]; then
-        sed -i '/^# === AegisTune BBR BEGIN ===/,/^# === AegisTune BBR END ===/d' /etc/sysctl.conf 2>/dev/null || true
+        _strip_aegis_sysctl_block /etc/sysctl.conf
     fi
 
     # 清理非 systemd 下写入 /etc/modules 的模块行（只删这三行，不清空文件）
