@@ -3818,11 +3818,12 @@ run_cake_install() {
     echo -e "${CYAN}安装模式: BBR + CAKE${NC}"
     detect_os && detect_pkg_manager && detect_init_system && detect_kernel
     check_bbr_support && check_qdisc_support
-    
+    create_config_snapshot "before_cake_install"
+
     if [[ $CAKE_AVAILABLE -eq 0 ]]; then
         install_cake_module
     fi
-    
+
     update_pkg_cache && install_dependencies
     install_kernel_modules && configure_sysctl
     verify_installation && show_final_message
@@ -3909,7 +3910,8 @@ main() {
             echo -e "${CYAN}快速安装模式: BBR + CAKE${NC}"
             detect_os && detect_pkg_manager && detect_init_system && detect_kernel
             check_bbr_support && check_qdisc_support
-            
+            create_config_snapshot "before_cli_cake_install"
+
             if [[ $CAKE_AVAILABLE -eq 0 ]]; then
                 install_cake_module
             fi
