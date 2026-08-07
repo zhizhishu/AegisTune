@@ -672,7 +672,14 @@ _BDP_CEIL=$((64 * 1024 * 1024))     # 缓冲上限 64MB（研究结论：别盲�
 
 # 取区域 RTT → BDP_RTT_MS。环境变量 AEGIS_RTT_MS 可覆盖；非交互默认跨太平洋
 _bdp_prompt_region_rtt() {
-    if [[ -n "${AEGIS_RTT_MS:-}" ]]; then BDP_RTT_MS="$AEGIS_RTT_MS"; return 0; fi
+    if [[ -n "${AEGIS_RTT_MS:-}" ]]; then
+        if [[ "$AEGIS_RTT_MS" =~ ^[0-9]+$ ]] && (( AEGIS_RTT_MS > 0 )); then
+            BDP_RTT_MS="$AEGIS_RTT_MS"; return 0
+        else
+            log_warn "AEGIS_RTT_MS='$AEGIS_RTT_MS' 非正整数，回退默认值 ${_BDP_RTT_TRANSPAC}ms"
+            BDP_RTT_MS="$_BDP_RTT_TRANSPAC"; return 0
+        fi
+    fi
     if [[ ! -t 0 ]]; then BDP_RTT_MS="$_BDP_RTT_TRANSPAC"; return 0; fi
     echo ""
     echo "线路区域（决定 RTT，用于按 BDP 算 TCP 缓冲）:"
@@ -691,7 +698,14 @@ _bdp_prompt_region_rtt() {
 
 # 取带宽 Mbps → BDP_BW_MBPS。环境变量 AEGIS_BW_MBPS 可覆盖；非交互默认 1000
 _bdp_prompt_bandwidth() {
-    if [[ -n "${AEGIS_BW_MBPS:-}" ]]; then BDP_BW_MBPS="$AEGIS_BW_MBPS"; return 0; fi
+    if [[ -n "${AEGIS_BW_MBPS:-}" ]]; then
+        if [[ "$AEGIS_BW_MBPS" =~ ^[0-9]+$ ]] && (( AEGIS_BW_MBPS > 0 )); then
+            BDP_BW_MBPS="$AEGIS_BW_MBPS"; return 0
+        else
+            log_warn "AEGIS_BW_MBPS='$AEGIS_BW_MBPS' 非正整数，回退默认值 1000 Mbps"
+            BDP_BW_MBPS=1000; return 0
+        fi
+    fi
     if [[ ! -t 0 ]]; then BDP_BW_MBPS=1000; return 0; fi
     read -p "端口/线路带宽 (Mbps，默认 1000): " BDP_BW_MBPS
     BDP_BW_MBPS="${BDP_BW_MBPS:-1000}"
@@ -735,11 +749,17 @@ net.ipv4.tcp_wmem = 4096 $_mid $_buf"
     mkdir -p /etc/sysctl.d
     echo "$CONFIG_CONTENT" > /etc/sysctl.d/99-bbr-tuning.conf
     
-    # Alpine 兼容：同时写入主配置文件
+    # Alpine 兼容：同时写入主配置文件（幂等：先删旧标记块再追加新块）
     if [[ "$OS_TYPE" == "alpine" ]]; then
         # 备份原配置
         [[ -f /etc/sysctl.conf ]] && cp /etc/sysctl.conf /etc/sysctl.conf.backup 2>/dev/null || true
-        echo "$CONFIG_CONTENT" >> /etc/sysctl.conf
+        # 删除旧标记块（如存在），保证幂等
+        sed -i '/^# === AegisTune BBR BEGIN ===/,/^# === AegisTune BBR END ===/d' /etc/sysctl.conf 2>/dev/null || true
+        {
+            printf '\n# === AegisTune BBR BEGIN ===\n'
+            echo "$CONFIG_CONTENT"
+            printf '# === AegisTune BBR END ===\n'
+        } >> /etc/sysctl.conf
     fi
     
     # 应用配置 (兼容多种系统)
@@ -2959,9 +2979,19 @@ uninstall() {
     rm -f /etc/sysctl.d/99-aegistune-auto-merged.conf
     rm -f /etc/sysctl.d/99-aegistune-forwarding.conf
     rm -f /etc/modules-load.d/network-tuning.conf
-    
+
+    # 清理 Alpine: 删除 /etc/sysctl.conf 里的 AegisTune 标记块
+    if [[ -f /etc/sysctl.conf ]]; then
+        sed -i '/^# === AegisTune BBR BEGIN ===/,/^# === AegisTune BBR END ===/d' /etc/sysctl.conf 2>/dev/null || true
+    fi
+
+    # 清理非 systemd 下写入 /etc/modules 的模块行（只删这三行，不清空文件）
+    if [[ -f /etc/modules ]]; then
+        sed -i '/^tcp_bbr$/d;/^sch_fq$/d;/^sch_cake$/d' /etc/modules 2>/dev/null || true
+    fi
+
     sysctl --system > /dev/null 2>&1
-    
+
     log_success "配置已删除"
     log_info "注意: BBR 和队列调度将在重启后恢复默认值"
 }
