@@ -844,6 +844,27 @@ ensure_python3_systemd() {
     python3 -c 'import systemd.journal' >/dev/null 2>&1
 }
 
+# 文件后端要 rsyslog 产出 /var/log/auth.log，但 Alpine 的 rsyslog 默认配置缺
+# authpriv->auth.log 规则(Debian 自带)，装了也产不出 auth.log；fail2ban 文件后端
+# 报 "Have not found any log file for sshd jail" 启动失败 → 校验必炸 → 回滚。
+# 修法：缺规则就补一条 + auth.log 不存在则兜底 touch 空文件(rsyslog 活着才有意义)。
+# systemd/Alpine(OpenRC) 两类主机同款问题同款修法，统一走这里。
+ensure_rsyslog_auth_log() {
+    # 1) Alpine rsyslog 默认配置没有 authpriv 规则：补一条到独立配置，幂等
+    # （规则可能自带在 rsyslog.conf 或已有 .d 片段里，两处都认，避免重复写）
+    if [[ -f /etc/rsyslog.conf ]] && ! { grep -qE 'authpriv[^#]*-/var/log/auth\.log|authpriv[^#]*/var/log/auth\.log' /etc/rsyslog.conf || grep -qsE 'authpriv' /etc/rsyslog.d/*.conf 2>/dev/null; }; then
+        cat > /etc/rsyslog.d/50-aegistune-auth.conf <<'EOF'
+# Added by AegisTune: Alpine rsyslog lacks the authpriv -> auth.log rule by default
+auth,authpriv.*                 /var/log/auth.log
+EOF
+        log_info "已补充 rsyslog authpriv 规则 (/etc/rsyslog.d/50-aegistune-auth.conf)"
+    fi
+    # 2) auth.log 仍不存在且 rsyslog 真在跑：兜底建空文件（否则 fail2ban 文件后端无日志可读）
+    if [[ ! -f /var/log/auth.log ]] && service_is_active_any rsyslog; then
+        : > /var/log/auth.log 2>/dev/null || true
+    fi
+}
+
 install_fail2ban_basic() {
     log_section "配置 Fail2ban (SSH 防护)"
     detect_os
@@ -898,10 +919,8 @@ install_fail2ban_basic() {
         # 装了没跑=文件永远空，fail2ban 能启动却静默零防护(监控一个永不增长的空文件)，比启动失败更坏。
         if [[ -f /var/log/auth.log ]] || service_is_active_any rsyslog; then
             f2b_backend="auto"
-            # 仅当 rsyslog 确实活着时才兜底建空 auth.log（它会被喂日志）；否则留空文件会让下次运行误判 + 静默空转。
-            if [[ ! -f /var/log/auth.log ]] && service_is_active_any rsyslog; then
-                : > /var/log/auth.log 2>/dev/null || true
-            fi
+            # 兜底补 authpriv 规则 + 建空 auth.log（仅当 rsyslog 活着；空文件会被喂日志）
+            ensure_rsyslog_auth_log
         elif ensure_python3_systemd; then
             # 纯 journald、无 auth.log/rsyslog：退到 systemd 后端读 journald
             f2b_backend="systemd"
@@ -935,11 +954,9 @@ EOF
     # 只有文件后端才需要 rsyslog 产出 auth.log；systemd 后端直接读 journald，无需 rsyslog。
     if [[ "$f2b_backend" != "systemd" ]]; then
         service_action_any restart rsyslog || true
-        # 回退到文件后端的 systemd 主机：auth.log 可能尚不存在，兜底建空文件，
-        # 否则 fail2ban 文件后端会因 "Have not found any log file for sshd jail" 启动失败。
-        if [[ "$host_mgr" == "systemd" && ! -f /var/log/auth.log ]]; then
-            : > /var/log/auth.log 2>/dev/null || true
-        fi
+        # 统一兜底：补 Alpine 缺的 authpriv 规则 + auth.log 不存在则建空文件
+        # （systemd 和 Alpine/OpenRC 主机同款缺口同款修法，缺了必致 fail2ban 启动失败回滚）
+        ensure_rsyslog_auth_log
     fi
     service_enable_any fail2ban || true
     service_action_any restart fail2ban || service_action_any start fail2ban || true
